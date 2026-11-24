@@ -1,0 +1,6 @@
+{
+  "name": "QuantLab - Backtest & Paper Trading",
+  "description": "Piattaforma quantitativa per backtesting multi-strategia, AI Strategy Discovery Lab per la ricerca di ipotesi non convenzionali, ranking anti-overfitting e paper trading automatico.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
