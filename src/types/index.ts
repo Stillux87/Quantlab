@@ -284,11 +284,15 @@ export interface BacktestMetrics {
   avgLossPct: number;
   riskRewardRatio: number;
   maxDrawdownPct: number;
+  avgDrawdownPct?: number;
   maxDrawdownDurationDays: number;
+  recoveryFactor?: number;
   avgDurationMinutes: number;
   sharpeRatio: number;
   sortinoRatio: number;
   calmarRatio: number;
+  cagrReliable?: boolean;
+  metricsAvailable?: boolean;
   oosReturnPct: number;
   trainReturnPct: number;
   valReturnPct: number;
@@ -319,6 +323,14 @@ export interface BacktestMetrics {
   isRejectedOverfitted?: boolean;          // true if flagged as overfitted
   rejectionReason?: string;                // why it was discarded
   strategyFamily?: 'UNGER' | 'TRADITIONAL_INDICATOR';
+  totalCommissionPaid?: number;
+  totalSlippagePaid?: number;
+  monteCarloAvailable?: boolean;
+  monteCarloReason?: string;
+  monteCarloLossProbabilityPct?: number;
+  monteCarloCagrP05Pct?: number;
+  monteCarloCagrP50Pct?: number;
+  monteCarloCagrP95Pct?: number;
 }
 
 export interface BenchmarkMetrics {
@@ -375,6 +387,31 @@ export interface BacktestResult {
   };
   titanEct?: TitanEctSummary;
   entryDistribution?: EntryIntervalStats;
+  dataProvenance?: {
+    source: string;
+    timeframe: Timeframe;
+    dataStatus: 'HISTORICAL_REAL' | 'REALTIME' | 'DELAYED' | 'LAST_AVAILABLE' | 'SYNTHETIC_TEST_ONLY' | 'UNAVAILABLE';
+    isRealData: boolean;
+    fetchedAt: string;
+    warnings: string[];
+  };
+  costsConfig?: {
+    commissionPct: number;
+    slippagePct: number;
+    spreadPct: number;
+  };
+  splitRatios?: {
+    train: number;
+    val: number;
+    oos: number;
+  };
+  walkForward?: {
+    available: boolean;
+    windowsCount: number;
+    positiveOosWindows: number;
+    efficiencyPct: number;
+    avgOosReturnPct: number;
+  };
 }
 
 export type InactivityStatus = 'NORMAL' | 'ELEVATED_WAIT' | 'UNUSUAL' | 'ANOMALOUS';
@@ -490,6 +527,7 @@ export interface PortfolioConstituent {
 
 export interface PaperTradingSession {
   id: string;
+  ownerUid?: string;
   strategyId: string;
   strategyName: string;
   strategyCategory: StrategyCategory;
@@ -780,6 +818,7 @@ export interface OptimizationRunReport {
 
 export interface SavedStrategyPreset {
   id: string;
+  ownerUid?: string;
   name: string;
   description?: string;
   strategyId: string;

@@ -18,7 +18,8 @@ import {
   EntryIntervalStats,
 } from '../types';
 import { getStrategyById } from './strategies/registry';
-import { fetchLiveRealQuote } from './realMarketFeed';
+import { authenticatedFetch } from './authClient';
+import { evaluateIntrabarExit, updateTrailingStopAfterBar } from './executionMath';
 
 const STORAGE_KEY = 'quantlab_paper_trading_sessions_v5_clean';
 
@@ -82,10 +83,8 @@ export class PaperTradingEngine {
         if (Array.isArray(data.sessions)) {
           for (const s of data.sessions) {
             if (s && s.id) {
-              // NEVER resurrect a locally deleted session
               if (this.deletedSessionIds.has(s.id)) {
-                // Ensure server is kept in sync by sending DELETE request
-                fetch(`/api/paper/sessions/${s.id}`, { method: 'DELETE' }).catch(() => {});
+                authenticatedFetch(`/api/paper/sessions/${s.id}`, { method: 'DELETE' }).catch(() => {});
                 continue;
               }
               const current = this.sessions.get(s.id);
@@ -174,7 +173,7 @@ export class PaperTradingEngine {
             const dup = portfolioSessions[i];
             this.sessions.delete(dup.id);
             this.deletedSessionIds.add(dup.id);
-            fetch(`/api/paper/sessions/${dup.id}`, { method: 'DELETE' }).catch(() => {});
+            authenticatedFetch(`/api/paper/sessions/${dup.id}`, { method: 'DELETE' }).catch(() => {});
             hasChanges = true;
           }
           this.saveDeletedToStorage();
@@ -304,13 +303,13 @@ export class PaperTradingEngine {
     this.sessions.set(id, session);
     this.notify();
 
-    // Sync to backend server
-    fetch('/api/paper/sessions', {
+    // Sync to backend server with Firebase Auth token
+    authenticatedFetch('/api/paper/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...config, id }),
     })
-      .then((res) => res.json())
+      .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (data && data.session) {
           this.sessions.set(data.session.id, data.session);
@@ -392,7 +391,7 @@ export class PaperTradingEngine {
       this.saveToStorage();
       this.notify();
 
-      fetch('/api/paper/sessions', {
+      authenticatedFetch('/api/paper/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(existingPortfolio),
@@ -494,13 +493,13 @@ export class PaperTradingEngine {
     this.sessions.set(id, session);
     this.notify();
 
-    // Sync to backend server
-    fetch('/api/paper/sessions', {
+    // Sync to backend server with Firebase Auth token
+    authenticatedFetch('/api/paper/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(session),
     })
-      .then((res) => res.json())
+      .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (data && data.session) {
           this.sessions.set(data.session.id, data.session);
@@ -531,53 +530,38 @@ export class PaperTradingEngine {
       pos.currentPrice = currentBar.close;
       pos.durationMinutes = Math.max(1, Math.round((currentBar.timestamp - pos.entryTimestamp) / (60 * 1000)));
 
-      if (currentBar.high > pos.highestPriceSinceEntry) pos.highestPriceSinceEntry = currentBar.high;
-      if (currentBar.low < pos.lowestPriceSinceEntry) pos.lowestPriceSinceEntry = currentBar.low;
+      // ZERO LOOK-AHEAD: evaluate stop/TP using PRIOR active stop BEFORE updating bar excursion/trailing
+      const posState = {
+        direction: pos.direction,
+        entryPrice: pos.entryPrice,
+        quantity: pos.quantity,
+        stopLoss: pos.stopLoss,
+        takeProfit: pos.takeProfit,
+        trailingStop: pos.trailingStop,
+        highestPriceSinceEntry: pos.highestPriceSinceEntry,
+        lowestPriceSinceEntry: pos.lowestPriceSinceEntry,
+      };
+      const intrabarExit = evaluateIntrabarExit(posState, currentBar, {
+        slippagePct: session.slippagePct,
+        spreadPct: 0.02,
+      });
 
-      if (session.params.trailingStopPct && Number(session.params.trailingStopPct) > 0) {
-        const trailPct = Number(session.params.trailingStopPct);
-        if (pos.direction === 'LONG') {
-          const trailPrice = pos.highestPriceSinceEntry * (1 - trailPct / 100);
-          if (!pos.trailingStop || trailPrice > pos.trailingStop) {
-            pos.trailingStop = trailPrice;
-          }
-        } else {
-          const trailPrice = pos.lowestPriceSinceEntry * (1 + trailPct / 100);
-          if (!pos.trailingStop || trailPrice < pos.trailingStop) {
-            pos.trailingStop = trailPrice;
-          }
-        }
-      }
-
-      const activeStop = pos.trailingStop
-        ? (pos.direction === 'LONG'
-            ? (pos.trailingStop > pos.stopLoss ? pos.trailingStop : pos.stopLoss)
-            : (pos.trailingStop < pos.stopLoss ? pos.trailingStop : pos.stopLoss))
-        : pos.stopLoss;
-      let exitPrice: number | null = null;
-      let exitReason: Trade['exitReason'] = 'MANUAL';
-
-      if (pos.direction === 'LONG') {
-        if (currentBar.low <= activeStop) {
-          exitPrice = activeStop * (1 - session.slippagePct / 100);
-          exitReason = activeStop === pos.trailingStop ? 'TRAILING_STOP' : 'STOP_LOSS';
-        } else if (currentBar.high >= pos.takeProfit) {
-          exitPrice = pos.takeProfit * (1 - session.slippagePct / 100);
-          exitReason = 'TAKE_PROFIT';
-        }
-      } else if (pos.direction === 'SHORT') {
-        if (currentBar.high >= activeStop) {
-          exitPrice = activeStop * (1 + session.slippagePct / 100);
-          exitReason = activeStop === pos.trailingStop ? 'TRAILING_STOP' : 'STOP_LOSS';
-        } else if (currentBar.low <= pos.takeProfit) {
-          exitPrice = pos.takeProfit * (1 + session.slippagePct / 100);
-          exitReason = 'TAKE_PROFIT';
-        }
-      }
-
-      if (exitPrice !== null) {
-        this.closePositionInternal(session, pos, exitPrice, currentBar.timestamp, currentBar.dateStr, exitReason);
+      if (intrabarExit.exited && intrabarExit.exitReason !== null) {
+        this.closePositionInternal(
+          session,
+          pos,
+          intrabarExit.exitPrice,
+          currentBar.timestamp,
+          currentBar.dateStr,
+          intrabarExit.exitReason
+        );
       } else {
+        const trailPct = Number(session.params.trailingStopPct || 0);
+        updateTrailingStopAfterBar(posState, currentBar, trailPct > 0 ? trailPct : undefined);
+        pos.highestPriceSinceEntry = posState.highestPriceSinceEntry;
+        pos.lowestPriceSinceEntry = posState.lowestPriceSinceEntry;
+        pos.trailingStop = posState.trailingStop;
+
         const grossPnl = pos.direction === 'LONG'
           ? (pos.currentPrice - pos.entryPrice) * pos.quantity
           : (pos.entryPrice - pos.currentPrice) * pos.quantity;
@@ -794,24 +778,31 @@ export class PaperTradingEngine {
     return newPos;
   }
 
-  public manualClosePosition(sessionId: string, positionId: string, currentPrice: number): void {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
-    const pos = (session.openPositions || []).find((p) => p.id === positionId);
-    if (!pos) return;
-
-    const now = Date.now();
-    const dateStr = new Date(now).toISOString().replace('T', ' ').substring(0, 16);
-
-    this.closePositionInternal(session, pos, currentPrice, now, dateStr, 'MANUAL');
-    session.openPositions = (session.openPositions || []).filter((p) => p.id !== positionId);
-    this.notify();
-
-    fetch(`/api/paper/sessions/${sessionId}/close-position`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ positionId, currentPrice }),
-    }).catch((e) => console.warn('Manual close sync error:', e));
+  public async manualClosePosition(
+    sessionId: string,
+    positionId: string,
+    _ignoredClientPrice?: number
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      // Authoritative server-side closure: client NEVER dictates execution price or P&L
+      const res = await authenticatedFetch(`/api/paper/sessions/${sessionId}/close-position`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ positionId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return { ok: false, error: data.error || `Chiusura rifiutata (HTTP ${res.status})` };
+      }
+      if (data && data.session) {
+        this.sessions.set(data.session.id, data.session);
+        this.notify(false);
+      }
+      return { ok: true };
+    } catch (e: any) {
+      console.warn('Manual close sync error:', e);
+      return { ok: false, error: e?.message || 'Errore di connessione durante la chiusura' };
+    }
   }
 
   public togglePauseSession(sessionId: string): void {
@@ -821,7 +812,7 @@ export class PaperTradingEngine {
     this.addLog(session, 'INFO', 'ENGINE', `Paper trading ${session.isPaused ? 'in PAUSA' : 'RIPRESO'}`);
     this.notify();
 
-    fetch(`/api/paper/sessions/${sessionId}/pause`, { method: 'POST' }).catch((e) =>
+    authenticatedFetch(`/api/paper/sessions/${sessionId}/pause`, { method: 'POST' }).catch((e) =>
       console.warn('Pause sync error:', e)
     );
   }
@@ -834,7 +825,7 @@ export class PaperTradingEngine {
     this.addAlert(session, 'SYSTEM', 'Strategia Interrotta', `${session.strategyName} su ${session.instrument.ticker} è stata fermata.`);
     this.notify();
 
-    fetch(`/api/paper/sessions/${sessionId}/stop`, { method: 'POST' }).catch((e) =>
+    authenticatedFetch(`/api/paper/sessions/${sessionId}/stop`, { method: 'POST' }).catch((e) =>
       console.warn('Stop sync error:', e)
     );
   }
@@ -851,7 +842,7 @@ export class PaperTradingEngine {
         if (s.isPortfolio || s.strategyCategory === 'MULTI_STRATEGY' || id.includes('portfolio')) {
           this.deletedSessionIds.add(id);
           this.sessions.delete(id);
-          fetch(`/api/paper/sessions/${id}`, { method: 'DELETE' }).catch(() => {});
+          authenticatedFetch(`/api/paper/sessions/${id}`, { method: 'DELETE' }).catch(() => {});
         }
       }
     }
@@ -860,15 +851,16 @@ export class PaperTradingEngine {
     this.saveToStorage();
     this.notify();
 
-    fetch(`/api/paper/sessions/${sessionId}`, { method: 'DELETE' }).catch((e) =>
+    authenticatedFetch(`/api/paper/sessions/${sessionId}`, { method: 'DELETE' }).catch((e) =>
       console.warn('Delete sync error:', e)
     );
   }
 
   public async consolidateSessions(): Promise<{ consolidatedCount: number; portfolioSessionId: string }> {
     try {
-      const res = await fetch('/api/paper/consolidate', { method: 'POST' });
+      const res = await authenticatedFetch('/api/paper/consolidate', { method: 'POST' });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       if (data && Array.isArray(data.sessions)) {
         this.sessions.clear();
         for (const s of data.sessions) {
@@ -895,39 +887,34 @@ export class PaperTradingEngine {
     timeframe?: Timeframe;
     wipeOnly?: boolean;
   }): Promise<{ deletedCount: number; newSession: PaperTradingSession | null }> {
-    try {
-      for (const id of Array.from(this.sessions.keys())) {
-        this.deletedSessionIds.add(id);
-      }
-      this.sessions.clear();
-      this.saveDeletedToStorage();
-      this.saveToStorage();
-
-      const res = await fetch('/api/paper/reset-clean', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(options || {}),
-      });
-      const data = await res.json();
-      if (data && Array.isArray(data.sessions)) {
-        for (const s of data.sessions) {
-          if (s && s.id) {
-            this.deletedSessionIds.delete(s.id);
-            this.sessions.set(s.id, s);
-          }
-        }
-        this.saveDeletedToStorage();
-        this.saveToStorage();
-        this.notify(false);
-      }
-      return {
-        deletedCount: data?.deletedCount || 0,
-        newSession: data?.newSession || null,
-      };
-    } catch (e) {
-      console.warn('Failed to reset clean sessions:', e);
-      return { deletedCount: 0, newSession: null };
+    const res = await authenticatedFetch('/api/paper/reset-clean', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(options || {}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || `Reset non autorizzato o fallito (HTTP ${res.status})`);
     }
+    for (const id of Array.from(this.sessions.keys())) {
+      this.deletedSessionIds.add(id);
+    }
+    this.sessions.clear();
+    if (data && Array.isArray(data.sessions)) {
+      for (const s of data.sessions) {
+        if (s && s.id) {
+          this.deletedSessionIds.delete(s.id);
+          this.sessions.set(s.id, s);
+        }
+      }
+    }
+    this.saveDeletedToStorage();
+    this.saveToStorage();
+    this.notify(false);
+    return {
+      deletedCount: data?.deletedCount || 0,
+      newSession: data?.newSession || null,
+    };
   }
 
   public markAlertAsRead(sessionId: string, alertId: string): void {

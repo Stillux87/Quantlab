@@ -1,7 +1,7 @@
 /**
  * QuantLab - View 5: Backtest (High-Contrast Color-Differentiated Theme, 100% Real Historical Bars)
- * Runs deterministic backtests exclusively on verified real Yahoo Finance OHLCV series
- * returned by /api/market/history (never falls back to synthetic bars).
+ * Runs deterministic zero-look-ahead backtests exclusively on verified real Yahoo Finance OHLCV series
+ * returned by /api/market/history (never falls back to synthetic bars), with full quantitative audit transparency.
  */
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
@@ -14,11 +14,12 @@ import {
   Tooltip,
   CartesianGrid,
 } from 'recharts';
-import { Play, Download, AlertCircle, RefreshCw } from 'lucide-react';
+import { Play, Download, AlertCircle, RefreshCw, ShieldCheck, AlertTriangle } from 'lucide-react';
 import { Bar, BacktestResult, Instrument, Timeframe } from '../types';
 import { INSTRUMENTS_DATABASE } from '../data/instruments';
 import { ALL_STRATEGIES } from '../services/strategies/registry';
 import { runBacktest } from '../services/backtestEngine';
+import { evaluateStrategyQualification } from '../services/rankingEngine';
 
 interface LightBacktestViewProps {
   initialTicker: string;
@@ -110,7 +111,10 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
 }) => {
   const [ticker, setTicker] = useState<string>(initialTicker || 'NVDA');
   const [timeframe, setTimeframe] = useState<Timeframe>(
-    initialTimeframe === '1h' || initialTimeframe === '4h' || initialTimeframe === '1D'
+    initialTimeframe === '1h' ||
+      initialTimeframe === '2h' ||
+      initialTimeframe === '4h' ||
+      initialTimeframe === '1D'
       ? initialTimeframe
       : '1h'
   );
@@ -123,6 +127,12 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [barCount, setBarCount] = useState<number>(0);
+  const [dataSourceLabel, setDataSourceLabel] = useState<string>('Yahoo Finance Real-Time Market API');
+  const [effectiveRange, setEffectiveRange] = useState<{ start: string; end: string }>({
+    start: '',
+    end: '',
+  });
+  const [dataWarnings, setDataWarnings] = useState<string[]>([]);
 
   useEffect(() => {
     if (initialTicker && initialTicker !== ticker) {
@@ -146,6 +156,7 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
   const executeBacktest = useCallback(async () => {
     setIsLoading(true);
     setErrorMsg(null);
+    setDataWarnings([]);
     try {
       const { startDate, endDate } = getDateRangeForPreset(period, timeframe);
       const url = `/api/market/history?ticker=${encodeURIComponent(ticker)}&timeframe=${encodeURIComponent(timeframe)}&startDate=${startDate}&endDate=${endDate}`;
@@ -172,9 +183,19 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
         commissionPct: 0.05,
         slippagePct: 0.03,
         spreadPct: 0.02,
+        trainRatio: 0.7,
+        valRatio: 0.15,
+        oosRatio: 0.15,
+        dataProvenance: data.provenance,
       });
 
       setBarCount(realBars.length);
+      setDataSourceLabel(data.source || 'Yahoo Finance Real-Time Market API');
+      setEffectiveRange({
+        start: realBars[0]?.dateStr?.slice(0, 10) || startDate,
+        end: realBars[realBars.length - 1]?.dateStr?.slice(0, 10) || endDate,
+      });
+      setDataWarnings(Array.isArray(data.provenance?.warnings) ? data.provenance.warnings : []);
       setResult(bt);
     } catch (e: any) {
       setResult(null);
@@ -187,6 +208,11 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
   useEffect(() => {
     executeBacktest();
   }, [executeBacktest]);
+
+  const qualification = useMemo(() => {
+    if (!result) return null;
+    return evaluateStrategyQualification(result);
+  }, [result]);
 
   const chartData = useMemo(() => {
     if (!result?.equityCurve?.length) return [];
@@ -208,11 +234,14 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
       'N',
       'Ticker',
       'Direzione',
+      'Split',
       'Ingresso',
       'Prezzo Ingresso',
       'Uscita',
       'Prezzo Uscita',
       'Quantita',
+      'Commissioni',
+      'Slippage',
       'PnL %',
       'PnL €',
       'Motivo Uscita',
@@ -221,11 +250,14 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
       t.tradeNumber,
       t.symbol,
       t.direction,
+      t.splitType,
       t.entryDateStr,
       t.entryPrice.toFixed(4),
       t.exitDateStr,
       t.exitPrice.toFixed(4),
       t.quantity.toFixed(4),
+      t.commission.toFixed(2),
+      t.slippage.toFixed(2),
       t.pnlPercent.toFixed(2),
       t.pnlAmount.toFixed(2),
       t.exitReason,
@@ -243,19 +275,32 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
   const m = result?.metrics;
   const curSymbol = result?.instrument?.currencySymbol || '$';
 
+  const verdictStyle = (verdict: string) => {
+    if (verdict === 'PROMOSSA') {
+      return 'bg-emerald-50 border-emerald-300 text-emerald-900';
+    }
+    if (verdict === 'DA_OSSERVARE') {
+      return 'bg-amber-50 border-amber-300 text-amber-950';
+    }
+    if (verdict === 'DATI_INSUFFICIENTI') {
+      return 'bg-slate-100 border-slate-300 text-slate-800';
+    }
+    return 'bg-rose-50 border-rose-300 text-rose-900';
+  };
+
   return (
     <div className="space-y-6 animate-fadeIn">
       {/* Header */}
       <section className="bg-white border border-slate-300/80 rounded-xl p-6 shadow-xs flex flex-col sm:flex-row sm:items-end justify-between gap-4">
         <div>
           <p className="text-xs font-semibold text-blue-700">
-            Validazione Storica su Dati Reali Yahoo Finance
+            Validazione Storica Zero Look-Ahead · Dati Reali Verificati Yahoo Finance
           </p>
           <h1 className="text-2xl sm:text-3xl font-bold text-slate-950 tracking-tight mt-0.5">
-            Laboratorio Backtest
+            Laboratorio Backtest Quantitativo
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            Verifica le strategie su candele storiche reali senza dati sintetici, includendo commissioni e slippage realistici.
+            Segnali eseguiti sull&apos;apertura della candela successiva (barra i+1), costi reali (0.05% comm. + 0.03% slippage + 0.02% spread) e split cronologico 70/15/15.
           </p>
         </div>
         {result && result.trades.length > 0 && (
@@ -270,7 +315,7 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
         )}
       </section>
 
-      {/* Parameter Control Bar (Cool Slate-Indigo Tinted Band) */}
+      {/* Parameter Control Bar */}
       <section className="bg-indigo-50/75 border border-indigo-200 rounded-xl p-5 shadow-xs">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 items-end">
           <div>
@@ -308,8 +353,8 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
 
           <div>
             <label className="block text-xs font-bold text-indigo-950 mb-1.5">Timeframe</label>
-            <div className="grid grid-cols-3 rounded-lg bg-slate-200/90 p-1">
-              {(['1h', '4h', '1D'] as Timeframe[]).map((tf) => (
+            <div className="grid grid-cols-4 rounded-lg bg-slate-200/90 p-1">
+              {(['1h', '2h', '4h', '1D'] as Timeframe[]).map((tf) => (
                 <button
                   key={tf}
                   type="button"
@@ -399,6 +444,58 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
       {/* Results */}
       {result && m && (
         <>
+          {/* Data Provenance & Qualification Audit Banner */}
+          <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <div className="lg:col-span-2 bg-white border border-slate-300/80 rounded-xl p-4 shadow-xs flex flex-col justify-between gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs font-bold text-emerald-800">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>DATI STORICI REALI VERIFICATI · {dataSourceLabel}</span>
+                </div>
+                <span className="text-xs font-mono text-slate-600 tabular-nums">
+                  {effectiveRange.start} → {effectiveRange.end} ({barCount} barre {timeframe})
+                </span>
+              </div>
+              <p className="text-xs text-slate-700">
+                Modello costi: Commissione 0.05% · Slippage 0.03% · Spread 0.02% · Esecuzione barra i+1 Open · Collisione SL/TP conservativa (SL prioritario).
+              </p>
+              {(m.totalTrades < 20 || dataWarnings.length > 0) && (
+                <div className="flex items-start gap-2 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mt-1">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="space-y-0.5">
+                    {m.totalTrades < 20 && (
+                      <p>
+                        Campione statistico ridotto ({m.totalTrades} trade &lt; 20 consigliati): valutare con cautela prima dell&apos;operatività.
+                      </p>
+                    )}
+                    {dataWarnings.slice(0, 2).map((w, idx) => (
+                      <p key={idx}>{w}</p>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {qualification && (
+              <div className={`border rounded-xl p-4 shadow-xs flex flex-col justify-between ${verdictStyle(qualification.verdict)}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-bold uppercase tracking-wide">
+                    Verdetto Qualificazione
+                  </span>
+                  <span className="text-xs font-extrabold font-mono px-2 py-0.5 rounded bg-white/75 border border-current">
+                    {qualification.verdict.replace('_', ' ')}
+                  </span>
+                </div>
+                <p className="text-xs mt-2 leading-relaxed">
+                  {qualification.verdictReasons[0]}
+                </p>
+                <p className="text-[11px] font-mono opacity-80 mt-1.5">
+                  Score composito: {m.score}/100
+                </p>
+              </div>
+            )}
+          </section>
+
           {/* 4 Color-Differentiated KPI Cards */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div
@@ -431,36 +528,101 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
             </div>
 
             <div className="bg-rose-50/80 border border-rose-200 border-t-[3px] border-t-rose-600 rounded-xl p-5 shadow-xs">
-              <p className="text-xs font-semibold text-rose-800">Max Drawdown</p>
+              <p className="text-xs font-semibold text-rose-800">Max Drawdown &amp; Durata</p>
               <p className="text-2xl font-bold font-mono tabular-nums text-rose-800 mt-2">
                 -{Math.abs(m.maxDrawdownPct).toFixed(2)}%
               </p>
               <p className="text-xs text-rose-900/80 mt-1 tabular-nums font-medium">
-                CAGR {m.cagrPct >= 0 ? '+' : ''}
-                {m.cagrPct.toFixed(1)}% · Vol {m.volatilityPct?.toFixed(1) ?? '—'}%
+                CAGR {m.cagrReliable === false ? 'N/D (<14gg)' : `${m.cagrPct >= 0 ? '+' : ''}${m.cagrPct.toFixed(1)}%`} · Max DD {m.maxDrawdownDurationDays}gg
               </p>
             </div>
 
             <div className="bg-indigo-50/80 border border-indigo-200 border-t-[3px] border-t-indigo-600 rounded-xl p-5 shadow-xs">
-              <p className="text-xs font-semibold text-indigo-800">Win Rate &amp; Operazioni</p>
+              <p className="text-xs font-semibold text-indigo-800">Win Rate &amp; Expectancy</p>
               <p className="text-2xl font-bold font-mono tabular-nums text-indigo-950 mt-2">
                 {m.winRatePct.toFixed(1)}%
               </p>
               <p className="text-xs text-indigo-900/80 mt-1 tabular-nums font-medium">
-                {m.totalTrades} trade ({m.winningTrades} vinti · {m.losingTrades} persi)
+                {m.totalTrades} trade ({m.winningTrades}W · {m.losingTrades}L) · Exp {m.expectancy >= 0 ? '+' : ''}€{m.expectancy.toFixed(1)}
               </p>
             </div>
 
             <div className="bg-amber-50/85 border border-amber-200 border-t-[3px] border-t-amber-500 rounded-xl p-5 shadow-xs">
-              <p className="text-xs font-semibold text-amber-900">Profit Factor &amp; Sharpe</p>
+              <p className="text-xs font-semibold text-amber-900">Profit Factor &amp; Sharpe Periodico</p>
               <p className="text-2xl font-bold font-mono tabular-nums text-amber-950 mt-2">
                 {m.profitFactor.toFixed(2)}
               </p>
               <p className="text-xs text-amber-900/85 mt-1 tabular-nums font-medium">
-                Sharpe {m.sharpeRatio.toFixed(2)} · {barCount} candele reali
+                Sharpe {m.sharpeRatio.toFixed(2)} · Sortino {m.sortinoRatio.toFixed(2)} · Calmar {m.calmarRatio.toFixed(2)}
               </p>
             </div>
           </div>
+
+          {/* Chronological 70/15/15 Split & Seeded Monte Carlo Audit */}
+          <section className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+            <div className="bg-white border border-slate-300/80 rounded-xl p-4 shadow-xs">
+              <p className="text-xs font-bold text-slate-600">Training (70%)</p>
+              <p
+                className={`text-lg font-bold font-mono tabular-nums mt-1 ${
+                  m.trainReturnPct >= 0 ? 'text-emerald-700' : 'text-rose-700'
+                }`}
+              >
+                {m.trainReturnPct >= 0 ? '+' : ''}
+                {m.trainReturnPct.toFixed(2)}%
+              </p>
+              <p className="text-xs text-slate-600 mt-1 tabular-nums">
+                DD -{(result.trainMetrics?.maxDrawdownPct ?? 0).toFixed(1)}% · PF {(result.trainMetrics?.profitFactor ?? 0).toFixed(2)}
+              </p>
+            </div>
+
+            <div className="bg-white border border-slate-300/80 rounded-xl p-4 shadow-xs">
+              <p className="text-xs font-bold text-slate-600">Validation (15%)</p>
+              <p
+                className={`text-lg font-bold font-mono tabular-nums mt-1 ${
+                  m.valReturnPct >= 0 ? 'text-emerald-700' : 'text-rose-700'
+                }`}
+              >
+                {m.valReturnPct >= 0 ? '+' : ''}
+                {m.valReturnPct.toFixed(2)}%
+              </p>
+              <p className="text-xs text-slate-600 mt-1 tabular-nums">
+                DD -{(result.valMetrics?.maxDrawdownPct ?? 0).toFixed(1)}% · PF {(result.valMetrics?.profitFactor ?? 0).toFixed(2)}
+              </p>
+            </div>
+
+            <div className="bg-white border border-slate-300/80 rounded-xl p-4 shadow-xs">
+              <p className="text-xs font-bold text-blue-700">Out-of-Sample (15%)</p>
+              <p
+                className={`text-lg font-bold font-mono tabular-nums mt-1 ${
+                  m.oosReturnPct >= 0 ? 'text-emerald-700' : 'text-rose-700'
+                }`}
+              >
+                {m.oosReturnPct >= 0 ? '+' : ''}
+                {m.oosReturnPct.toFixed(2)}%
+              </p>
+              <p className="text-xs text-slate-600 mt-1 tabular-nums">
+                DD -{(result.oosMetrics?.maxDrawdownPct ?? 0).toFixed(1)}% · PF {(result.oosMetrics?.profitFactor ?? 0).toFixed(2)}
+              </p>
+            </div>
+
+            <div className="bg-slate-900 text-slate-100 border border-slate-800 rounded-xl p-4 shadow-xs">
+              <p className="text-xs font-bold text-sky-300">Monte Carlo (Seeded)</p>
+              {m.monteCarloAvailable ? (
+                <>
+                  <p className="text-lg font-bold font-mono tabular-nums text-white mt-1">
+                    DD P95: -{(m.monteCarloMaxDrawdown95Pct ?? 0).toFixed(1)}%
+                  </p>
+                  <p className="text-xs text-slate-300 mt-1 tabular-nums">
+                    Rischio perdita: {(m.monteCarloLossProbabilityPct ?? 0).toFixed(1)}% · Rovina: {(m.monteCarloRuinProbabilityPct ?? 0).toFixed(1)}%
+                  </p>
+                </>
+              ) : (
+                <p className="text-xs text-slate-300 mt-2 leading-relaxed">
+                  {m.monteCarloReason || 'Campione < 10 trade: simulazione Monte Carlo non calcolabile con affidabilità.'}
+                </p>
+              )}
+            </div>
+          </section>
 
           {/* Equity Curve vs Benchmark / Drawdown */}
           <section className="bg-white border border-slate-300/80 rounded-xl overflow-hidden shadow-xs">
@@ -472,7 +634,7 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
                     : `Drawdown Storico — ${ticker} (${timeframe})`}
                 </h2>
                 <p className="text-xs text-slate-600 mt-0.5">
-                  Blu: Strategia · Arancione tratteggiato: Buy &amp; Hold sullo stesso titolo
+                  Blu: Strategia · Arancione tratteggiato: Buy &amp; Hold sullo stesso titolo · Recovery Factor: {(m.recoveryFactor ?? 0).toFixed(2)}
                 </p>
               </div>
               <div className="inline-flex rounded-lg bg-slate-200/90 p-1 self-start sm:self-auto">
@@ -582,7 +744,7 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
             </div>
           </section>
 
-          {/* Trade Blotter with High-Contrast Header & Zebra Striping */}
+          {/* Trade Blotter */}
           <section className="bg-white border border-slate-300/80 rounded-xl overflow-hidden shadow-xs">
             <div className="px-6 py-4 bg-slate-100 border-b border-slate-200 flex items-center justify-between">
               <div>
@@ -590,7 +752,7 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
                   Registro Operazioni Storiche ({result.trades.length})
                 </h2>
                 <p className="text-xs text-slate-600 mt-0.5">
-                  Mostrate le ultime {Math.min(50, result.trades.length)} operazioni in ordine cronologico inverso
+                  Mostrate le ultime {Math.min(50, result.trades.length)} operazioni in ordine cronologico inverso · Commissioni totali: €{(m.totalCommissionPaid ?? 0).toFixed(2)}
                 </p>
               </div>
             </div>
@@ -605,6 +767,7 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
                   <thead>
                     <tr className="border-b border-slate-300 bg-slate-200/75 text-xs font-bold text-slate-700">
                       <th className="py-3 px-4">#</th>
+                      <th className="py-3 px-4">Split</th>
                       <th className="py-3 px-4">Ingresso</th>
                       <th className="py-3 px-4">Uscita</th>
                       <th className="py-3 px-4 text-right">Prezzo In</th>
@@ -623,6 +786,9 @@ export const LightBacktestView: React.FC<LightBacktestViewProps> = ({
                         <tr key={t.id} className="odd:bg-white even:bg-slate-50/80 hover:bg-blue-50/60">
                           <td className="py-2.5 px-4 font-mono text-xs text-slate-600 tabular-nums">
                             {t.tradeNumber}
+                          </td>
+                          <td className="py-2.5 px-4 text-[11px] font-bold text-slate-600">
+                            {t.splitType}
                           </td>
                           <td className="py-2.5 px-4 text-xs text-slate-800 tabular-nums">
                             {t.entryDateStr}

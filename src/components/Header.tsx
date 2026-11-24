@@ -1,9 +1,11 @@
 /**
  * QuantLab - High-Contrast Deep Navy Top Navigation Bar (Strict 3-Zone Contract)
- * Anchors the daylight interface with crisp visual separation and vivid active indicators.
+ * Anchors the daylight interface with crisp visual separation, vivid active indicators,
+ * and integrated Firebase Google Authentication controls.
  */
 import React from 'react';
-import { RefreshCw } from 'lucide-react';
+import { RefreshCw, LogIn, LogOut } from 'lucide-react';
+import type { AuthUserProfile } from '../services/authClient';
 
 export type ActiveTab =
   | 'home'
@@ -30,6 +32,9 @@ interface HeaderProps {
   setActiveTab: (tab: ActiveTab) => void;
   isRunningAiCycle: boolean;
   onRunAiCycle: () => void;
+  authUser: AuthUserProfile | null;
+  onSignIn: () => void;
+  onSignOut: () => void;
 }
 
 const NAV_ITEMS: Array<{ id: ActiveTab; label: string }> = [
@@ -45,6 +50,9 @@ export const Header: React.FC<HeaderProps> = ({
   setActiveTab,
   isRunningAiCycle,
   onRunAiCycle,
+  authUser,
+  onSignIn,
+  onSignOut,
 }) => {
   const normalizedTab: ActiveTab =
     activeTab === 'scanner'
@@ -60,7 +68,7 @@ export const Header: React.FC<HeaderProps> = ({
   return (
     <header className="sticky top-0 z-40 bg-[#0F172A] border-b border-slate-800 shadow-sm">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between gap-8 h-16">
+        <div className="flex items-center justify-between gap-4 sm:gap-8 h-16">
           {/* Zone 1: Single-line Brand Wordmark */}
           <button
             type="button"
@@ -71,7 +79,7 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
 
           {/* Zone 2: 5 clean single-line navigation links */}
-          <nav aria-label="Navigazione principale" className="hidden md:flex items-center gap-7">
+          <nav aria-label="Navigazione principale" className="hidden md:flex items-center gap-6">
             {NAV_ITEMS.map((item) => {
               const isActive = normalizedTab === item.id;
               return (
@@ -95,8 +103,33 @@ export const Header: React.FC<HeaderProps> = ({
             })}
           </nav>
 
-          {/* Zone 3: Single Primary Action */}
-          <div className="flex items-center shrink-0">
+          {/* Zone 3: Auth Control + Primary Action */}
+          <div className="flex items-center gap-2.5 shrink-0">
+            {authUser ? (
+              <button
+                id="header-signout-btn"
+                type="button"
+                onClick={onSignOut}
+                title={`Connesso come ${authUser.email || authUser.displayName || 'Utente'}`}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <span className="max-w-[110px] truncate">
+                  {authUser.displayName?.split(' ')[0] || authUser.email?.split('@')[0] || 'Account'}
+                </span>
+                <LogOut className="w-3.5 h-3.5 text-slate-400" />
+              </button>
+            ) : (
+              <button
+                id="header-signin-btn"
+                type="button"
+                onClick={onSignIn}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <LogIn className="w-3.5 h-3.5 text-sky-400" />
+                <span>Accedi</span>
+              </button>
+            )}
+
             <button
               id="header-run-ai-btn"
               type="button"

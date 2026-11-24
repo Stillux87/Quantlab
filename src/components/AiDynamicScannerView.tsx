@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import { Instrument, Timeframe } from '../types';
 import { globalPaperTradingEngine } from '../services/paperTradingEngine';
+import { authenticatedFetch } from '../services/authClient';
 
 export interface AiScannerOpportunity {
   ticker: string;
@@ -76,7 +77,7 @@ export const AiDynamicScannerView: React.FC<AiDynamicScannerViewProps> = ({
   const [filterMode, setFilterMode] = useState<'ALL' | 'BUY_READY' | 'US' | 'EU'>('ALL');
   const [opportunities, setOpportunities] = useState<AiScannerOpportunity[]>([]);
   const [aiSummary, setAiSummary] = useState<string>('');
-  const [eurUsdRate, setEurUsdRate] = useState<number>(1.085);
+  const [eurUsdRate, setEurUsdRate] = useState<number | null>(null);
   const [updatedAt, setUpdatedAt] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isRunningAi, setIsRunningAi] = useState<boolean>(false);
@@ -91,17 +92,19 @@ export const AiDynamicScannerView: React.FC<AiDynamicScannerViewProps> = ({
         setIsLoading(true);
       }
       try {
-        const res = await fetch('/api/ai/scanner', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ timeframe: tf, useAi: withGeminiAi }),
-        });
+        const res = withGeminiAi
+          ? await authenticatedFetch('/api/ai/scanner', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ timeframe: tf, useAi: true }),
+            })
+          : await fetch(`/api/ai/scanner?timeframe=${encodeURIComponent(tf)}&ai=false`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (data && Array.isArray(data.opportunities)) {
           setOpportunities(data.opportunities);
           setAiSummary(data.aiMarketSummary || '');
-          if (data.eurUsdRate) setEurUsdRate(data.eurUsdRate);
+          setEurUsdRate(typeof data.eurUsdRate === 'number' ? data.eurUsdRate : null);
           setUpdatedAt(
             new Date(data.updatedAt || Date.now()).toLocaleTimeString('it-IT', {
               hour: '2-digit',
@@ -205,7 +208,7 @@ export const AiDynamicScannerView: React.FC<AiDynamicScannerViewProps> = ({
                 Prezzi Reali Verificati ($ USD / € EUR)
               </span>
               <span className="text-xs font-mono text-slate-400">
-                Cambio Live EUR/USD: <strong className="text-slate-200 tabular-nums">{eurUsdRate.toFixed(4)}</strong>
+                Cambio Live EUR/USD: <strong className="text-slate-200 tabular-nums">{eurUsdRate !== null ? eurUsdRate.toFixed(4) : 'N/D'}</strong>
               </span>
             </div>
             <h1 className="text-xl sm:text-2xl font-bold text-white tracking-tight">

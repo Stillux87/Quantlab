@@ -7,14 +7,11 @@
  * - Web news & market catalysts come from Gemini Google Search Grounding with clickable URLs.
  * - Every AI trade decision is guarded by strict server-side Stop Loss limits.
  */
-import fs from 'fs';
 import path from 'path';
 import { GoogleGenAI, Type } from '@google/genai';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { db } from './firebase';
-import { INSTRUMENTS_DATABASE } from '../data/instruments';
 import { calculateEMA, calculateRSI, calculateATR } from './indicators';
 import { serverPaperTradingEngine } from './serverPaperTradingEngine';
+import { atomicWriteJsonFile, readValidatedJsonFile } from './apiSecurity';
 import {
   AiAutopilotConfig,
   AiAutopilotState,
@@ -152,7 +149,8 @@ class AiAutopilotService {
   private isRunning = false;
   private lastRunAt: number | null = null;
   private lastBriefingAt: number | null = null;
-  private eurUsdRate = 1.085;
+  private eurUsdRate: number | null = null;
+  private eurUsdFetchedAt: number | null = null;
   private briefings: AiMarketBriefing[] = [];
   private decisions: AiDecisionRecord[] = [];
   private marketSnapshot: AiLiveTickerSnapshot[] = [];
@@ -163,7 +161,6 @@ class AiAutopilotService {
     if (this.isInitialized) return;
     this.isInitialized = true;
     this.loadFromDisk();
-    await this.loadFromFirestore();
 
     // Refresh real verified snapshot immediately in background (non-blocking)
     this.refreshVerifiedMarketSnapshot()
@@ -198,7 +195,7 @@ class AiAutopilotService {
       isRunning: this.isRunning,
       lastRunAt: this.lastRunAt,
       lastBriefingAt: this.lastBriefingAt,
-      eurUsdRate: this.eurUsdRate,
+      eurUsdRate: this.eurUsdRate ?? 0,
       briefings: this.briefings.slice(0, 15),
       decisions: this.decisions.slice(0, 80),
       marketSnapshot: this.marketSnapshot,
@@ -235,11 +232,15 @@ class AiAutopilotService {
    * Any ticker whose real feed fails is excluded — ZERO fabricated prices.
    */
   public async refreshVerifiedMarketSnapshot(): Promise<AiLiveTickerSnapshot[]> {
-    // 1. Live EUR/USD exchange rate
+    // 1. Live EUR/USD exchange rate (NEVER substitute hardcoded fallback if unavailable)
     const fxJson = await fetchYahooRaw('https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X?interval=1d&range=5d', 4500);
     const liveFx = fxJson?.chart?.result?.[0]?.meta?.regularMarketPrice;
-    if (typeof liveFx === 'number' && liveFx > 0.5 && liveFx < 2.0) {
+    if (typeof liveFx === 'number' && Number.isFinite(liveFx) && liveFx > 0.5 && liveFx < 2.0) {
       this.eurUsdRate = parseFloat(liveFx.toFixed(4));
+      this.eurUsdFetchedAt = Date.now();
+    } else if (this.eurUsdFetchedAt && Date.now() - this.eurUsdFetchedAt > 15 * 60_000) {
+      // Expire stale FX rate rather than silently using outdated/hardcoded FX
+      this.eurUsdRate = null;
     }
 
     const snapshots: AiLiveTickerSnapshot[] = [];
@@ -289,7 +290,11 @@ class AiAutopilotService {
           const isEur = item.ticker.endsWith('.MI') || item.ticker.endsWith('.DE') || item.ticker.endsWith('.PA');
           const currency = isEur ? 'EUR' : (meta.currency || 'USD').toUpperCase();
           const currencySymbol = currency === 'USD' ? '$' : currency === 'GBP' ? '£' : '€';
-          const fxRateToEur = currency === 'EUR' ? 1.0 : parseFloat((1 / this.eurUsdRate).toFixed(4));
+          if (currency !== 'EUR' && (!this.eurUsdRate || this.eurUsdRate <= 0)) {
+            // Skip non-EUR conversion if live FX is unavailable (never fabricate FX)
+            return;
+          }
+          const fxRateToEur = currency === 'EUR' ? 1.0 : parseFloat((1 / this.eurUsdRate!).toFixed(4));
 
           const closes = bars.map((b) => b.close);
           const ema9Arr = calculateEMA(closes, 9);
@@ -488,7 +493,7 @@ Scrivi in italiano un aggiornamento mercati chiaro, concreto e conciso per un in
               : ['Monitoraggio attivo dei prezzi reali su azioni USA e FTSE MIB con protezione Stop Loss automatica.'],
           tickerHighlights: tickerHighlights.slice(0, 5),
           sources: sources.slice(0, 8),
-          eurUsdRate: this.eurUsdRate,
+          eurUsdRate: this.eurUsdRate ?? 0,
           verifiedTickersCount: snap.length,
           poweredByWebSearch: true,
         };
@@ -530,7 +535,7 @@ Scrivi in italiano un aggiornamento mercati chiaro, concreto e conciso per un in
           liveWebNews.length > 0
             ? `Aggiornamento Mercati Live: ${bullishCount}/${snap.length} titoli rialzisti su 1h e ${liveWebNews.length} notizie verificate`
             : `Quadro Tecnico Live: ${bullishCount}/${snap.length} titoli in struttura rialzista su 1h`,
-        summaryIt: `Analisi aggiornata su ${snap.length} quotazioni reali verificate in diretta (EUR/USD ${this.eurUsdRate.toFixed(4)}) integrata con le ultime agenzie finanziarie raccolte dal web. I titoli con miglior spinta relativa sono ${topPos.slice(0, 3).map((s) => `${s.ticker} (${s.change24h >= 0 ? '+' : ''}${s.change24h}%)`).join(', ')}.`,
+        summaryIt: `Analisi aggiornata su ${snap.length} quotazioni reali verificate in diretta (EUR/USD ${this.eurUsdRate ? this.eurUsdRate.toFixed(4) : 'non disponibile'}) integrata con le ultime agenzie finanziarie raccolte dal web. I titoli con miglior spinta relativa sono ${topPos.slice(0, 3).map((s) => `${s.ticker} (${s.change24h >= 0 ? '+' : ''}${s.change24h}%)`).join(', ')}.`,
         macroDrivers:
           newsDrivers.length > 0
             ? [
@@ -553,7 +558,7 @@ Scrivi in italiano un aggiornamento mercati chiaro, concreto e conciso per un in
           };
         }),
         sources: webSources,
-        eurUsdRate: this.eurUsdRate,
+        eurUsdRate: this.eurUsdRate ?? 0,
         verifiedTickersCount: snap.length,
         poweredByWebSearch: webSources.length > 0,
       };
@@ -928,79 +933,47 @@ REGOLE OPERATIVE OBBLIGATORIE:
   }
 
   private loadFromDisk() {
-    try {
-      if (!fs.existsSync(STATE_FILE)) return;
-      const raw = fs.readFileSync(STATE_FILE, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (parsed.config) this.config = { ...DEFAULT_CONFIG, ...parsed.config };
-      if (Array.isArray(parsed.briefings)) this.briefings = parsed.briefings.slice(0, 20);
-      if (Array.isArray(parsed.decisions)) this.decisions = parsed.decisions.slice(0, 120);
-      if (typeof parsed.lastRunAt === 'number') this.lastRunAt = parsed.lastRunAt;
-      if (typeof parsed.lastBriefingAt === 'number') this.lastBriefingAt = parsed.lastBriefingAt;
-      if (typeof parsed.eurUsdRate === 'number' && parsed.eurUsdRate > 0.5) this.eurUsdRate = parsed.eurUsdRate;
-    } catch (err: any) {
-      console.warn('[AiAutopilot] Disk load notice:', err?.message || err);
+    const parsed = readValidatedJsonFile<Record<string, any>>(
+      STATE_FILE,
+      (v): v is Record<string, any> => typeof v === 'object' && v !== null && !Array.isArray(v)
+    );
+    if (!parsed) return;
+    if (parsed.config) this.config = { ...DEFAULT_CONFIG, ...parsed.config };
+    if (Array.isArray(parsed.briefings)) this.briefings = parsed.briefings.slice(0, 20);
+    if (Array.isArray(parsed.decisions)) this.decisions = parsed.decisions.slice(0, 120);
+    if (typeof parsed.lastRunAt === 'number') this.lastRunAt = parsed.lastRunAt;
+    if (typeof parsed.lastBriefingAt === 'number') this.lastBriefingAt = parsed.lastBriefingAt;
+    if (
+      typeof parsed.eurUsdRate === 'number' &&
+      parsed.eurUsdRate > 0.5 &&
+      typeof parsed.eurUsdFetchedAt === 'number' &&
+      Date.now() - parsed.eurUsdFetchedAt < 15 * 60_000
+    ) {
+      this.eurUsdRate = parsed.eurUsdRate;
+      this.eurUsdFetchedAt = parsed.eurUsdFetchedAt;
     }
   }
 
   private saveToDisk() {
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
       const payload = {
         config: this.config,
         lastRunAt: this.lastRunAt,
         lastBriefingAt: this.lastBriefingAt,
         eurUsdRate: this.eurUsdRate,
+        eurUsdFetchedAt: this.eurUsdFetchedAt,
         briefings: this.briefings.slice(0, 20),
         decisions: this.decisions.slice(0, 120),
       };
-      fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2), 'utf-8');
+      atomicWriteJsonFile(STATE_FILE, payload);
     } catch (err: any) {
-      console.warn('[AiAutopilot] Disk save notice:', err?.message || err);
-    }
-  }
-
-  private async loadFromFirestore() {
-    try {
-      const fetchPromise = getDoc(doc(db, 'ai_autopilot', 'state'));
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Firestore ai_autopilot timeout')), 3500)
-      );
-      const snap: any = await Promise.race([fetchPromise, timeoutPromise]);
-      if (snap && snap.exists()) {
-        const data = snap.data();
-        if (data.config) this.config = { ...this.config, ...data.config };
-        if (Array.isArray(data.briefings) && data.briefings.length > this.briefings.length) {
-          this.briefings = data.briefings.slice(0, 20);
-        }
-        if (Array.isArray(data.decisions) && data.decisions.length > this.decisions.length) {
-          this.decisions = data.decisions.slice(0, 120);
-        }
-      }
-    } catch {
-      // Resilient local fallback
+      console.warn('[AiAutopilot] Atomic disk save notice:', err?.message || err);
     }
   }
 
   private async saveToFirestore() {
-    try {
-      const payload = JSON.parse(
-        JSON.stringify({
-          config: this.config,
-          lastRunAt: this.lastRunAt,
-          lastBriefingAt: this.lastBriefingAt,
-          eurUsdRate: this.eurUsdRate,
-          briefings: this.briefings.slice(0, 10),
-          decisions: this.decisions.slice(0, 40),
-          updatedAt: Date.now(),
-        })
-      );
-      await setDoc(doc(db, 'ai_autopilot', 'state'), payload);
-    } catch {
-      // Ignore quota or offline errors gracefully
-    }
+    // Server-side state is authoritatively persisted atomically on disk;
+    // Firestore writes require verified admin auth enforced by hardened firestore.rules.
   }
 }
 

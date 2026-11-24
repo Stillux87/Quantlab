@@ -1,83 +1,120 @@
 {
   "entities": {
-    "PaperTradingSession": {
-      "title": "PaperTradingSession",
-      "description": "A persistent automated paper trading session running on the server",
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated QuantLab user profile with isolated PII and non-self-escalating role.",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "Unique session identifier" },
-        "strategyId": { "type": "string", "description": "Identifier of the trading strategy" },
-        "strategyName": { "type": "string", "description": "Name of the strategy" },
-        "strategyCategory": { "type": "string", "description": "Strategy classification" },
-        "instrument": { "type": "object", "description": "Financial asset definition" },
-        "timeframe": { "type": "string", "description": "Selected timeframe interval" },
-        "params": { "type": "object", "description": "Custom strategy parameters" },
-        "createdAt": { "type": "number", "description": "Creation timestamp in ms" },
-        "startedAt": { "type": "number", "description": "Start timestamp in ms" },
-        "isActive": { "type": "boolean", "description": "Whether the session is currently active" },
-        "isPaused": { "type": "boolean", "description": "Whether execution is temporarily paused" },
-        "initialCapital": { "type": "number", "description": "Starting cash balance" },
-        "currentCapital": { "type": "number", "description": "Current cash balance" },
-        "riskPerTradePct": { "type": "number", "description": "Risk percentage per trade" },
-        "commissionPct": { "type": "number", "description": "Commission percentage per order" },
-        "slippagePct": { "type": "number", "description": "Slippage percentage per order" },
-        "openPositions": { "type": "array", "description": "List of active positions" },
-        "closedTrades": { "type": "array", "description": "List of completed trades" },
-        "logs": { "type": "array", "description": "Chronological execution and decision logs" },
-        "alerts": { "type": "array", "description": "System and trade alert notifications" },
-        "equityHistory": { "type": "array", "description": "Historical equity progression" },
-        "lastBarProcessed": { "type": "object", "description": "Last evaluated candle bar" },
-        "lastServerTick": { "type": "number", "description": "Timestamp of last server tick" },
-        "isConsolidated": { "type": "boolean", "description": "Whether session is consolidated into multi-asset portfolio" },
-        "consolidatedIntoSessionId": { "type": "string", "description": "ID of parent portfolio session" },
-        "regimeFilter": { "type": "object", "description": "Macro regime gating configuration and status" }
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "role": { "type": "string", "enum": ["viewer", "trader", "admin"] },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
       },
-      "required": ["id", "strategyId", "instrument", "timeframe", "initialCapital", "currentCapital", "isActive"]
+      "required": ["uid", "email", "displayName", "role", "createdAt", "updatedAt"]
+    },
+    "PaperSession": {
+      "title": "PaperSession",
+      "description": "Persistent real-market paper trading session scoped to its ownerUid.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "ownerUid": { "type": "string" },
+        "strategyId": { "type": "string" },
+        "strategyName": { "type": "string" },
+        "strategyCategory": { "type": "string" },
+        "instrument": { "type": "object" },
+        "timeframe": { "type": "string" },
+        "params": { "type": "object" },
+        "createdAt": { "type": "number" },
+        "startedAt": { "type": "number" },
+        "isActive": { "type": "boolean" },
+        "isPaused": { "type": "boolean" },
+        "initialCapital": { "type": "number" },
+        "currentCapital": { "type": "number" },
+        "riskPerTradePct": { "type": "number" },
+        "commissionPct": { "type": "number" },
+        "slippagePct": { "type": "number" },
+        "openPositions": { "type": "array" },
+        "closedTrades": { "type": "array" },
+        "logs": { "type": "array" },
+        "alerts": { "type": "array" },
+        "equityHistory": { "type": "array" }
+      },
+      "required": ["id", "ownerUid", "strategyId", "strategyName", "timeframe", "initialCapital", "currentCapital", "isActive", "isPaused", "createdAt"]
+    },
+    "SavedStrategy": {
+      "title": "SavedStrategy",
+      "description": "User-saved quantitative strategy preset scoped to ownerUid.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "ownerUid": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "strategyId": { "type": "string" },
+        "strategyName": { "type": "string" },
+        "instrument": { "type": "object" },
+        "timeframe": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "tags": { "type": "array" }
+      },
+      "required": ["id", "ownerUid", "name", "strategyId", "strategyName", "timeframe", "createdAt"]
     },
     "ServerState": {
       "title": "ServerState",
-      "description": "Background trading engine status and heartbeat",
+      "description": "Global background trading worker heartbeat and runtime state (admin write only).",
       "type": "object",
       "properties": {
-        "lastHeartbeat": { "type": "number", "description": "Last worker heartbeat in ms" },
-        "activeSessionsCount": { "type": "number", "description": "Count of running background strategies" },
-        "serverStatus": { "type": "string", "description": "Worker status string" }
+        "lastHeartbeat": { "type": "number" },
+        "activeSessionsCount": { "type": "number" },
+        "serverStatus": { "type": "string" },
+        "tickCount": { "type": "number" },
+        "updatedAt": { "type": "number" }
       },
-      "required": ["lastHeartbeat", "serverStatus"]
+      "required": ["lastHeartbeat", "activeSessionsCount", "serverStatus", "tickCount"]
     },
-    "SavedStrategyPreset": {
-      "title": "SavedStrategyPreset",
-      "description": "User saved optimized trading strategy preset",
+    "AiAutopilotState": {
+      "title": "AiAutopilotState",
+      "description": "AI Portfolio Manager configuration, verified market briefings, and decision log (admin write only).",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "Unique preset identifier" },
-        "name": { "type": "string", "description": "User given name" },
-        "description": { "type": "string", "description": "Optional strategy notes" },
-        "strategyId": { "type": "string", "description": "Strategy algorithm identifier" },
-        "strategyName": { "type": "string", "description": "Display name of strategy algorithm" },
-        "instrument": { "type": "object", "description": "Target financial asset" },
-        "timeframe": { "type": "string", "description": "Timeframe interval" },
-        "dateRange": { "type": "object", "description": "Optimization date range window" },
-        "params": { "type": "object", "description": "Optimized hyper-parameters" },
-        "originalMetrics": { "type": "object", "description": "Backtest metrics at time of save" },
-        "createdAt": { "type": "string", "description": "ISO timestamp of creation" },
-        "tags": { "type": "array", "description": "Labels or tags" }
+        "config": { "type": "object" },
+        "lastRunAt": { "type": "number" },
+        "lastBriefingAt": { "type": "number" },
+        "eurUsdRate": { "type": "number" },
+        "briefings": { "type": "array" },
+        "decisions": { "type": "array" },
+        "updatedAt": { "type": "number" }
       },
-      "required": ["id", "name", "strategyId", "instrument", "timeframe", "params", "originalMetrics", "createdAt"]
+      "required": ["config", "updatedAt"]
     }
   },
   "firestore": {
+    "/admins/{adminUid}": {
+      "schema": { "type": "object" },
+      "description": "Trusted administrator UID registry."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Authenticated user profile documents."
+    },
     "/paper_sessions/{sessionId}": {
-      "schema": { "$ref": "#/entities/PaperTradingSession" },
-      "description": "Collection of all paper trading sessions tracked by the 24/7 backend server"
+      "schema": { "$ref": "#/entities/PaperSession" },
+      "description": "Owner-scoped real-market paper trading sessions."
+    },
+    "/saved_strategies/{strategyId}": {
+      "schema": { "$ref": "#/entities/SavedStrategy" },
+      "description": "Owner-scoped saved quantitative strategies."
     },
     "/server_state/{stateId}": {
       "schema": { "$ref": "#/entities/ServerState" },
-      "description": "Server health and background ticker telemetry"
+      "description": "Server worker heartbeat and status metadata."
     },
-    "/saved_strategies/{strategyId}": {
-      "schema": { "$ref": "#/entities/SavedStrategyPreset" },
-      "description": "User saved optimized strategies collection"
+    "/ai_autopilot/{docId}": {
+      "schema": { "$ref": "#/entities/AiAutopilotState" },
+      "description": "Autonomous AI autopilot state, briefings, and decision audit trail."
     }
   }
 }

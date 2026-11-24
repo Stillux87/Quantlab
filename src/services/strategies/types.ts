@@ -30,3 +30,5 @@ export interface IStrategy {
     overlayOnPrice: boolean;
   }[];
 }
+
+export type BaseStrategy = IStrategy;

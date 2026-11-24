@@ -117,7 +117,7 @@ export const QuantLabHomeView: React.FC<QuantLabHomeViewProps> = ({
           <p className="text-xs font-semibold text-blue-700">
             Portafoglio AI autonomo · Dati reali verificati in borsa · Cambio EUR/USD{' '}
             <span className="font-mono tabular-nums text-slate-900">
-              {(aiState?.eurUsdRate || 1.085).toFixed(4)}
+              {aiState?.eurUsdRate ? aiState.eurUsdRate.toFixed(4) : 'N/D'}
             </span>
           </p>
           <h1

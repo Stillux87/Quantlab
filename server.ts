@@ -4,51 +4,84 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { serverPaperTradingEngine } from './src/services/serverPaperTradingEngine';
 import { serverSavedStrategyService } from './src/services/serverSavedStrategyService';
 import { aiAutopilotService } from './src/services/aiAutopilotService';
-import { generateHistoricalBars } from './src/services/dataFeed';
 import { INSTRUMENTS_DATABASE } from './src/data/instruments';
 import { calculateEMA, calculateRSI, calculateATR } from './src/services/indicators';
-import { Instrument, Timeframe } from './src/types';
+import { Bar, Instrument, Timeframe } from './src/types';
+import {
+  AuthenticatedRequest,
+  createRateLimiter,
+  requireAuth,
+  resolveRequestAuth,
+  validateDateParam,
+  validateFiniteNumber,
+  validateSafeId,
+  validateTicker,
+  validateTimeframe,
+} from './src/services/apiSecurity';
+import {
+  aggregateHourlyBars,
+  DataProvenance,
+  DataStatus,
+  FxRateResult,
+  validateAndCleanBars,
+} from './src/services/marketDataIntegrity';
 
 process.on('uncaughtException', (err) => {
-  console.error('[Server] Uncaught Exception (resiliently caught):', err?.message || err);
+  console.error('[Server] Fatal Uncaught Exception:', err?.stack || err?.message || err);
+  process.exit(1);
 });
 
-process.on('unhandledRejection', (reason: any) => {
-  console.warn('[Server] Unhandled Rejection (resiliently caught):', reason?.message || reason);
+process.on('unhandledRejection', (reason: unknown) => {
+  console.error('[Server] Unhandled Promise Rejection:', reason);
 });
 
 const app = express();
 const PORT = 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '512kb' }));
+
+// Global API rate limiter (120 req/min) + stricter limiter for mutating/AI routes (25 req/min)
+const apiRateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  maxRequests: 120,
+  keyPrefix: 'api',
+});
+const mutationRateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  maxRequests: 25,
+  keyPrefix: 'mut',
+});
+
+app.use('/api', apiRateLimiter);
 
 // In-memory cache for market quotes & history to reduce latency and respect rate limits
 const cache = new Map<string, { timestamp: number; data: any }>();
 const CACHE_TTL_MS = 20_000; // 20 seconds for quotes
 const HISTORY_CACHE_TTL_MS = 60_000; // 60 seconds for historical bars
+const FX_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes max freshness for FX rate
 
 /**
- * Normalizes symbols for Yahoo Finance v8 API and detects synthetic virtual assets
+ * Normalizes symbols for Yahoo Finance v8 API and detects virtual portfolio aliases
  */
-function normalizeYahooTicker(rawTicker: string): { yahooSymbol: string; isSynthetic: boolean } {
+function normalizeYahooTicker(rawTicker: string): { yahooSymbol: string; isVirtual: boolean } {
   const t = rawTicker.trim().toUpperCase();
   if (!t || t === 'PORTFOLIO' || t.startsWith('PORT_') || t.startsWith('PORTFOLIO_')) {
-    return { yahooSymbol: '', isSynthetic: true };
+    return { yahooSymbol: '', isVirtual: true };
   }
   const ALIASES: Record<string, string> = {
-    'EURUSD': 'EURUSD=X',
-    'GBPUSD': 'GBPUSD=X',
-    'USDJPY': 'USDJPY=X',
-    'AUDUSD': 'AUDUSD=X',
-    'EURGBP': 'EURGBP=X',
-    'EURCHF': 'EURCHF=X',
-    'EURJPY': 'EURJPY=X',
-    'USDCAD': 'USDCAD=X',
-    'USDCHF': 'USDCHF=X',
-    'NZDUSD': 'NZDUSD=X',
-    'FDAX': '^GDAXI',
-    'FGBL': 'FGBL=F',
-    'FIB': 'FTSEMIB.MI',
+    EURUSD: 'EURUSD=X',
+    GBPUSD: 'GBPUSD=X',
+    USDJPY: 'USDJPY=X',
+    AUDUSD: 'AUDUSD=X',
+    EURGBP: 'EURGBP=X',
+    EURCHF: 'EURCHF=X',
+    EURJPY: 'EURJPY=X',
+    USDCAD: 'USDCAD=X',
+    USDCHF: 'USDCHF=X',
+    NZDUSD: 'NZDUSD=X',
+    FDAX: '^GDAXI',
+    FGBL: 'FGBL=F',
+    FIB: 'FTSEMIB.MI',
     'ES=F': 'ES=F',
     'NQ=F': 'NQ=F',
     'CL=F': 'CL=F',
@@ -59,13 +92,13 @@ function normalizeYahooTicker(rawTicker: string): { yahooSymbol: string; isSynth
     'ZC=F': 'ZC=F',
     'KC=F': 'KC=F',
   };
-  return { yahooSymbol: ALIASES[t] || t, isSynthetic: false };
+  return { yahooSymbol: ALIASES[t] || t, isVirtual: false };
 }
 
 /**
- * Safely resolves an Instrument configuration for fallbacks
+ * Resolves instrument metadata strictly for descriptive labels (never for price fallback).
  */
-function getFallbackInstrument(ticker: string): Instrument {
+function getInstrumentMeta(ticker: string): Instrument {
   const found = INSTRUMENTS_DATABASE.find((i) => i.ticker.toUpperCase() === ticker.toUpperCase());
   if (found) return found;
 
@@ -73,32 +106,35 @@ function getFallbackInstrument(ticker: string): Instrument {
     id: ticker.toLowerCase(),
     ticker,
     isin: ticker,
-    name: ticker === 'PORTFOLIO' ? 'Portafoglio Strategico Globale' : ticker,
+    name: ticker,
     type: 'STOCK',
     market: 'Global',
     exchangeCode: 'MTA',
     currency: 'EUR',
     currencySymbol: '€',
-    currentPrice: 100,
+    currentPrice: 0,
     change24h: 0,
     change24hAmount: 0,
-    volume24h: 10000,
+    volume24h: 0,
     sector: 'Diversified',
     description: `Asset di mercato ${ticker}`,
-    dataRange: { startDate: '2019-01-01', endDate: '2026-12-31', totalBarsDaily: 1800 },
+    dataRange: { startDate: '', endDate: '', totalBarsDaily: 0 },
     dataQuality: {
-      score: 99,
+      score: 0,
       missingBarsPct: 0,
       duplicateBarsCount: 0,
-      volumeCompletenessPct: 100,
+      volumeCompletenessPct: 0,
       priceAnomalyCount: 0,
-      status: 'EXCELLENT',
+      status: 'GOOD',
     },
   };
 }
 
-// Simple fetch wrapper with browser-like headers, automatic query1/query2 failover, timeout and error handling
-async function fetchYahoo(url: string, timeoutMs = 7000): Promise<{ ok: boolean; status: number; statusText: string; data: any }> {
+// Fetch wrapper with query1/query2 failover, timeout and explicit error handling
+async function fetchYahoo(
+  url: string,
+  timeoutMs = 7000
+): Promise<{ ok: boolean; status: number; statusText: string; data: any }> {
   const trySingleUrl = async (targetUrl: string) => {
     try {
       const controller = new AbortController();
@@ -106,8 +142,9 @@ async function fetchYahoo(url: string, timeoutMs = 7000): Promise<{ ok: boolean;
       const res = await fetch(targetUrl, {
         signal: controller.signal,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          'Accept': 'application/json',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          Accept: 'application/json',
         },
       });
       clearTimeout(timer);
@@ -117,7 +154,7 @@ async function fetchYahoo(url: string, timeoutMs = 7000): Promise<{ ok: boolean;
       const json = await res.json();
       return { ok: true, status: 200, statusText: 'OK', data: json };
     } catch (err: any) {
-      return { ok: false, status: 500, statusText: err.message || 'Fetch failed', data: null };
+      return { ok: false, status: 500, statusText: err?.message || 'Fetch failed', data: null };
     }
   };
 
@@ -133,23 +170,84 @@ async function fetchYahoo(url: string, timeoutMs = 7000): Promise<{ ok: boolean;
   return primary;
 }
 
-// Helper to get live EUR/USD rate so USD positions can convert P&L to EUR accurately while preserving $ prices
-let cachedEurUsdRate = 1.085;
-let lastEurUsdFetch = 0;
+// Strict Live EUR/USD FX provider (ZERO hardcoded fallbacks such as 1.085 or 0.92)
+let cachedEurUsdRate: number | null = null;
+let lastEurUsdFetchMs = 0;
 
-async function getLiveEurUsdRate(): Promise<number> {
-  if (Date.now() - lastEurUsdFetch < 300_000 && cachedEurUsdRate > 0.5) {
-    return cachedEurUsdRate;
+async function getLiveEurUsdFx(): Promise<FxRateResult> {
+  const now = Date.now();
+  if (cachedEurUsdRate !== null && now - lastEurUsdFetchMs < FX_CACHE_TTL_MS) {
+    return {
+      pair: 'EUR/USD',
+      rate: cachedEurUsdRate,
+      usdToEur: parseFloat((1 / cachedEurUsdRate).toFixed(6)),
+      isVerified: true,
+      source: 'Yahoo Finance FX (EURUSD=X)',
+      fetchedAt: new Date(lastEurUsdFetchMs).toISOString(),
+      status: now - lastEurUsdFetchMs < 60_000 ? 'LIVE_VERIFIED' : 'CACHED_RECENT',
+    };
   }
+
   try {
-    const res = await fetchYahoo('https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X?interval=1d&range=5d', 4500);
+    const res = await fetchYahoo(
+      'https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X?interval=1d&range=5d',
+      4500
+    );
     const price = res.data?.chart?.result?.[0]?.meta?.regularMarketPrice;
-    if (typeof price === 'number' && price > 0.5 && price < 2.0) {
-      cachedEurUsdRate = price;
-      lastEurUsdFetch = Date.now();
+    if (typeof price === 'number' && Number.isFinite(price) && price > 0.5 && price < 2.0) {
+      cachedEurUsdRate = parseFloat(price.toFixed(6));
+      lastEurUsdFetchMs = now;
+      return {
+        pair: 'EUR/USD',
+        rate: cachedEurUsdRate,
+        usdToEur: parseFloat((1 / cachedEurUsdRate).toFixed(6)),
+        isVerified: true,
+        source: 'Yahoo Finance FX (EURUSD=X)',
+        fetchedAt: new Date(now).toISOString(),
+        status: 'LIVE_VERIFIED',
+      };
     }
-  } catch (_) {}
-  return cachedEurUsdRate;
+  } catch {
+    // Handled explicitly below without fabricating a static rate
+  }
+
+  // Expire stale cache rather than masking FX outage
+  cachedEurUsdRate = null;
+  return {
+    pair: 'EUR/USD',
+    rate: null,
+    usdToEur: null,
+    isVerified: false,
+    source: 'Yahoo Finance FX (EURUSD=X)',
+    fetchedAt: null,
+    status: 'UNAVAILABLE',
+    warning:
+      'Cambio reale EUR/USD temporaneamente non disponibile. Nessun tasso arbitrario sostituito.',
+  };
+}
+
+function resolveCurrencyFx(
+  currency: string,
+  fx: FxRateResult
+): { fxRateToEur: number | null; fxVerified: boolean } {
+  const curr = currency.toUpperCase();
+  if (curr === 'EUR') {
+    return { fxRateToEur: 1.0, fxVerified: true };
+  }
+  if (curr === 'USD' && fx.isVerified && fx.usdToEur !== null) {
+    return { fxRateToEur: parseFloat(fx.usdToEur.toFixed(4)), fxVerified: true };
+  }
+  return { fxRateToEur: null, fxVerified: false };
+}
+
+function checkSessionOwnership(
+  session: { ownerUid?: string } | undefined,
+  req: AuthenticatedRequest
+): boolean {
+  if (!req.authUser) return false;
+  if (req.authUser.isAdmin) return true;
+  if (!session?.ownerUid) return true; // Legacy pre-auth session manageable by verified user
+  return session.ownerUid === req.authUser.uid;
 }
 
 // -------------------------------------------------------------
@@ -164,29 +262,21 @@ app.get('/api/health', (_req: Request, res: Response) => {
 // Real-Time Quote for a single ticker
 app.get('/api/market/quote', async (req: Request, res: Response) => {
   try {
-    const ticker = (req.query.ticker as string || '').trim().toUpperCase();
-    if (!ticker) {
-      return res.status(400).json({ error: 'Ticker is required' });
+    const tickerCheck = validateTicker(req.query.ticker);
+    if (!tickerCheck.ok) {
+      return res.status(400).json({ error: tickerCheck.error });
     }
+    const ticker = tickerCheck.value;
+    const { yahooSymbol, isVirtual } = normalizeYahooTicker(ticker);
+    const inst = getInstrumentMeta(ticker);
 
-    const { yahooSymbol, isSynthetic } = normalizeYahooTicker(ticker);
-    const inst = getFallbackInstrument(ticker);
-
-    if (isSynthetic) {
-      return res.json({
+    if (isVirtual) {
+      return res.status(400).json({
         symbol: ticker,
-        name: inst.name,
-        price: inst.currentPrice,
-        previousClose: inst.previousClose || inst.currentPrice,
-        change24hAmount: 0,
-        change24h: 0,
-        currency: inst.currency,
-        currencySymbol: inst.currencySymbol,
-        high24h: inst.currentPrice,
-        low24h: inst.currentPrice,
-        volume24h: inst.volume24h,
-        exchange: inst.market,
-        marketState: 'REGULAR',
+        price: null,
+        isLiveVerified: false,
+        dataStatus: 'UNAVAILABLE' as DataStatus,
+        error: 'Ticker virtuale di portafoglio: nessuna quotazione diretta di borsa disponibile.',
         lastUpdated: new Date().toISOString(),
       });
     }
@@ -206,6 +296,7 @@ app.get('/api/market/quote', async (req: Request, res: Response) => {
         name: inst.name,
         price: null,
         isLiveVerified: false,
+        dataStatus: 'UNAVAILABLE' as DataStatus,
         error: 'Quotazione reale momentaneamente non raggiungibile dal feed di borsa',
         lastUpdated: new Date().toISOString(),
       });
@@ -218,32 +309,64 @@ app.get('/api/market/quote', async (req: Request, res: Response) => {
         name: inst.name,
         price: null,
         isLiveVerified: false,
+        dataStatus: 'UNAVAILABLE' as DataStatus,
         error: 'Dati di mercato reali non disponibili per questo ticker',
         lastUpdated: new Date().toISOString(),
       });
     }
 
     const meta = result.meta;
-    const price = meta.regularMarketPrice ?? meta.previousClose;
-    if (typeof price !== 'number' || isNaN(price) || price <= 0) {
+    const hasRegularPrice =
+      typeof meta.regularMarketPrice === 'number' &&
+      Number.isFinite(meta.regularMarketPrice) &&
+      meta.regularMarketPrice > 0;
+    const hasPrevClose =
+      typeof meta.previousClose === 'number' &&
+      Number.isFinite(meta.previousClose) &&
+      meta.previousClose > 0;
+
+    const price = hasRegularPrice ? meta.regularMarketPrice : hasPrevClose ? meta.previousClose : null;
+    if (price === null) {
       return res.status(503).json({
         symbol: ticker,
         name: inst.name,
         price: null,
         isLiveVerified: false,
+        dataStatus: 'UNAVAILABLE' as DataStatus,
         error: 'Prezzo reale non valido dal feed di borsa',
         lastUpdated: new Date().toISOString(),
       });
     }
-    const prevClose = meta.chartPreviousClose ?? meta.previousClose ?? price;
+
+    const dataStatus: DataStatus =
+      hasRegularPrice && meta.marketState === 'REGULAR'
+        ? 'REALTIME'
+        : hasRegularPrice
+        ? 'LAST_AVAILABLE'
+        : 'DELAYED';
+
+    const prevClose =
+      typeof meta.chartPreviousClose === 'number' && meta.chartPreviousClose > 0
+        ? meta.chartPreviousClose
+        : typeof meta.previousClose === 'number' && meta.previousClose > 0
+        ? meta.previousClose
+        : price;
     const change = price - prevClose;
     const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
 
-    const isEuropeanTicker = ticker.endsWith('.MI') || ticker.endsWith('.DE') || ticker.endsWith('.PA') || ticker.endsWith('.AS');
-    const resolvedCurrency = isEuropeanTicker ? 'EUR' : (meta.currency || inst.currency || 'USD').toUpperCase();
-    const resolvedSymbol = resolvedCurrency === 'USD' ? '$' : resolvedCurrency === 'GBP' ? '£' : '€';
-    const eurUsdRate = await getLiveEurUsdRate();
-    const fxRateToEur = resolvedCurrency === 'EUR' ? 1.0 : parseFloat((1 / eurUsdRate).toFixed(4));
+    const isEuropeanTicker =
+      ticker.endsWith('.MI') ||
+      ticker.endsWith('.DE') ||
+      ticker.endsWith('.PA') ||
+      ticker.endsWith('.AS');
+    const resolvedCurrency = isEuropeanTicker
+      ? 'EUR'
+      : (meta.currency || inst.currency || 'USD').toUpperCase();
+    const resolvedSymbol =
+      resolvedCurrency === 'USD' ? '$' : resolvedCurrency === 'GBP' ? '£' : '€';
+
+    const fx = await getLiveEurUsdFx();
+    const { fxRateToEur, fxVerified } = resolveCurrencyFx(resolvedCurrency, fx);
 
     const quoteData = {
       symbol: meta.symbol || ticker,
@@ -255,13 +378,21 @@ app.get('/api/market/quote', async (req: Request, res: Response) => {
       currency: resolvedCurrency,
       currencySymbol: resolvedSymbol,
       fxRateToEur,
-      eurUsdRate: parseFloat(eurUsdRate.toFixed(4)),
+      fxVerified,
+      eurUsdRate: fx.rate,
+      fxStatus: fx.status,
       isLiveVerified: true,
+      dataStatus,
+      source: 'Yahoo Finance Market Feed',
       high24h: meta.regularMarketDayHigh ?? meta.dayHigh ?? price,
       low24h: meta.regularMarketDayLow ?? meta.dayLow ?? price,
       volume24h: meta.regularMarketVolume ?? 0,
       exchange: meta.exchangeName || inst.market,
-      marketState: meta.marketState || 'REGULAR',
+      exchangeTimezone: meta.exchangeTimezoneName || undefined,
+      marketState: meta.marketState || 'CLOSED',
+      marketTime: meta.regularMarketTime
+        ? new Date(meta.regularMarketTime * 1000).toISOString()
+        : undefined,
       lastUpdated: new Date().toISOString(),
     };
 
@@ -270,51 +401,54 @@ app.get('/api/market/quote', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.warn('[MarketQuote] Avviso recupero quote:', err?.message || err);
     res.status(503).json({
-      symbol: (req.query.ticker as string || '').trim().toUpperCase(),
+      symbol: String(req.query.ticker || '').trim().toUpperCase(),
       price: null,
       isLiveVerified: false,
+      dataStatus: 'UNAVAILABLE' as DataStatus,
       error: 'Errore temporaneo nel collegamento al feed di borsa',
       lastUpdated: new Date().toISOString(),
     });
   }
 });
 
-// Real-Time Batch Quotes
+// Real-Time Batch Quotes (strict: never falls back to static catalog prices)
 app.get('/api/market/quotes', async (req: Request, res: Response) => {
   try {
-    const rawTickers = (req.query.tickers as string || '').split(',').map((t) => t.trim().toUpperCase()).filter(Boolean);
-    if (rawTickers.length === 0) {
-      return res.status(400).json({ error: 'Tickers parameter required' });
+    const rawList = String(req.query.tickers || '')
+      .split(',')
+      .map((t) => t.trim().toUpperCase())
+      .filter(Boolean);
+
+    if (rawList.length === 0) {
+      return res.status(400).json({ error: 'Parametro tickers obbligatorio' });
+    }
+    if (rawList.length > 40) {
+      return res.status(400).json({ error: 'Massimo 40 ticker per richiesta batch' });
+    }
+
+    const validTickers: string[] = [];
+    for (const raw of rawList) {
+      const check = validateTicker(raw);
+      if (check.ok) validTickers.push(check.value);
     }
 
     const quotes: Record<string, any> = {};
-    const eurUsdRate = await getLiveEurUsdRate();
+    const fx = await getLiveEurUsdFx();
 
     await Promise.all(
-      rawTickers.map(async (ticker) => {
+      validTickers.map(async (ticker) => {
         try {
-          const { yahooSymbol, isSynthetic } = normalizeYahooTicker(ticker);
-          const inst = getFallbackInstrument(ticker);
+          const { yahooSymbol, isVirtual } = normalizeYahooTicker(ticker);
+          const inst = getInstrumentMeta(ticker);
 
-          if (isSynthetic) {
-            const sym = inst.currency === 'USD' ? '$' : inst.currency === 'GBP' ? '£' : '€';
+          if (isVirtual) {
             quotes[ticker] = {
               symbol: ticker,
               name: inst.name,
-              price: inst.currentPrice,
-              previousClose: inst.previousClose || inst.currentPrice,
-              change24hAmount: 0,
-              change24h: 0,
-              currency: inst.currency,
-              currencySymbol: sym,
-              fxRateToEur: inst.currency === 'EUR' ? 1.0 : parseFloat((1 / eurUsdRate).toFixed(4)),
-              eurUsdRate: parseFloat(eurUsdRate.toFixed(4)),
+              price: null,
               isLiveVerified: false,
-              high24h: inst.currentPrice,
-              low24h: inst.currentPrice,
-              volume24h: inst.volume24h,
-              exchange: inst.market,
-              marketState: 'REGULAR',
+              dataStatus: 'UNAVAILABLE' as DataStatus,
+              error: 'Ticker virtuale non quotato direttamente',
               lastUpdated: new Date().toISOString(),
             };
             return;
@@ -333,15 +467,60 @@ app.get('/api/market/quotes', async (req: Request, res: Response) => {
 
           if (result && result.meta) {
             const meta = result.meta;
-            const price = meta.regularMarketPrice ?? meta.previousClose ?? inst.currentPrice;
-            const prevClose = meta.chartPreviousClose ?? meta.previousClose ?? price;
+            const hasRegularPrice =
+              typeof meta.regularMarketPrice === 'number' &&
+              Number.isFinite(meta.regularMarketPrice) &&
+              meta.regularMarketPrice > 0;
+            const hasPrevClose =
+              typeof meta.previousClose === 'number' &&
+              Number.isFinite(meta.previousClose) &&
+              meta.previousClose > 0;
+            const price = hasRegularPrice
+              ? meta.regularMarketPrice
+              : hasPrevClose
+              ? meta.previousClose
+              : null;
+
+            if (price === null) {
+              quotes[ticker] = {
+                symbol: ticker,
+                name: inst.name,
+                price: null,
+                isLiveVerified: false,
+                dataStatus: 'UNAVAILABLE' as DataStatus,
+                error: 'Prezzo non disponibile dal feed',
+                lastUpdated: new Date().toISOString(),
+              };
+              return;
+            }
+
+            const dataStatus: DataStatus =
+              hasRegularPrice && meta.marketState === 'REGULAR'
+                ? 'REALTIME'
+                : hasRegularPrice
+                ? 'LAST_AVAILABLE'
+                : 'DELAYED';
+
+            const prevClose =
+              typeof meta.chartPreviousClose === 'number' && meta.chartPreviousClose > 0
+                ? meta.chartPreviousClose
+                : typeof meta.previousClose === 'number' && meta.previousClose > 0
+                ? meta.previousClose
+                : price;
             const change = price - prevClose;
             const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
 
-            const isEuropeanTicker = ticker.endsWith('.MI') || ticker.endsWith('.DE') || ticker.endsWith('.PA') || ticker.endsWith('.AS');
-            const resolvedCurrency = isEuropeanTicker ? 'EUR' : (meta.currency || inst.currency || 'USD').toUpperCase();
-            const resolvedSymbol = resolvedCurrency === 'USD' ? '$' : resolvedCurrency === 'GBP' ? '£' : '€';
-            const fxRateToEur = resolvedCurrency === 'EUR' ? 1.0 : parseFloat((1 / eurUsdRate).toFixed(4));
+            const isEuropeanTicker =
+              ticker.endsWith('.MI') ||
+              ticker.endsWith('.DE') ||
+              ticker.endsWith('.PA') ||
+              ticker.endsWith('.AS');
+            const resolvedCurrency = isEuropeanTicker
+              ? 'EUR'
+              : (meta.currency || inst.currency || 'USD').toUpperCase();
+            const resolvedSymbol =
+              resolvedCurrency === 'USD' ? '$' : resolvedCurrency === 'GBP' ? '£' : '€';
+            const { fxRateToEur, fxVerified } = resolveCurrencyFx(resolvedCurrency, fx);
 
             const q = {
               symbol: meta.symbol || ticker,
@@ -353,13 +532,17 @@ app.get('/api/market/quotes', async (req: Request, res: Response) => {
               currency: resolvedCurrency,
               currencySymbol: resolvedSymbol,
               fxRateToEur,
-              eurUsdRate: parseFloat(eurUsdRate.toFixed(4)),
+              fxVerified,
+              eurUsdRate: fx.rate,
+              fxStatus: fx.status,
               isLiveVerified: true,
+              dataStatus,
+              source: 'Yahoo Finance Market Feed',
               high24h: meta.regularMarketDayHigh ?? meta.dayHigh ?? price,
               low24h: meta.regularMarketDayLow ?? meta.dayLow ?? price,
-              volume24h: meta.regularMarketVolume ?? inst.volume24h,
+              volume24h: meta.regularMarketVolume ?? 0,
               exchange: meta.exchangeName || inst.market,
-              marketState: meta.marketState || 'REGULAR',
+              marketState: meta.marketState || 'CLOSED',
               lastUpdated: new Date().toISOString(),
             };
             cache.set(cacheKey, { timestamp: Date.now(), data: q });
@@ -370,15 +553,17 @@ app.get('/api/market/quotes', async (req: Request, res: Response) => {
               name: inst.name,
               price: null,
               isLiveVerified: false,
+              dataStatus: 'UNAVAILABLE' as DataStatus,
               error: 'Feed non raggiungibile',
               lastUpdated: new Date().toISOString(),
             };
           }
-        } catch (e) {
+        } catch {
           quotes[ticker] = {
             symbol: ticker,
             price: null,
             isLiveVerified: false,
+            dataStatus: 'UNAVAILABLE' as DataStatus,
             error: 'Feed non raggiungibile',
             lastUpdated: new Date().toISOString(),
           };
@@ -386,10 +571,14 @@ app.get('/api/market/quotes', async (req: Request, res: Response) => {
       })
     );
 
-    res.json({ quotes });
+    res.json({
+      quotes,
+      fx,
+      fetchedAt: new Date().toISOString(),
+    });
   } catch (err: any) {
     console.warn('[MarketQuotes] Avviso recupero batch quotes:', err?.message || err);
-    res.json({ quotes: {} });
+    res.status(503).json({ quotes: {}, error: 'Errore recupero quotazioni batch' });
   }
 });
 
@@ -400,54 +589,72 @@ function isRangeOverTwoYearsServer(startDate?: string, endDate?: string): boolea
   if (isNaN(startMs)) return false;
   const endMs = endDate ? new Date(`${endDate}T23:59:59Z`).getTime() : Date.now();
   const twoYearsMs = 735 * 24 * 60 * 60 * 1000;
-  if (endMs - startMs > twoYearsMs) return true;
-  return false;
+  return endMs - startMs > twoYearsMs;
 }
 
-// Real Historical OHLCV Bars
+// Real Historical OHLCV Bars (100% REAL MARKET DATA ONLY — ZERO SYNTHETIC FALLBACK)
 app.get('/api/market/history', async (req: Request, res: Response) => {
+  const fetchedAt = new Date().toISOString();
   try {
-    const ticker = (req.query.ticker as string || '').trim().toUpperCase();
-    let timeframe = (req.query.timeframe as string || '1D') as Timeframe;
-    const startDate = (req.query.startDate as string || '').trim();
-    const endDate = (req.query.endDate as string || '').trim();
+    const tickerCheck = validateTicker(req.query.ticker);
+    if (!tickerCheck.ok) {
+      return res.status(400).json({ error: tickerCheck.error });
+    }
+    const ticker = tickerCheck.value;
 
-    if (!ticker) {
-      return res.status(400).json({ error: 'Ticker is required' });
+    const tfCheck = validateTimeframe(req.query.timeframe || '1D');
+    if (!tfCheck.ok) {
+      return res.status(400).json({ error: tfCheck.error });
+    }
+    let timeframe: Timeframe = tfCheck.value;
+
+    const startCheck = validateDateParam(req.query.startDate);
+    const endCheck = validateDateParam(req.query.endDate);
+    if (!startCheck.ok) return res.status(400).json({ error: startCheck.error });
+    if (!endCheck.ok) return res.status(400).json({ error: endCheck.error });
+    const startDate = startCheck.value || '';
+    const endDate = endCheck.value || '';
+
+    const { yahooSymbol, isVirtual } = normalizeYahooTicker(ticker);
+    const inst = getInstrumentMeta(ticker);
+
+    if (isVirtual) {
+      const provenance: DataProvenance = {
+        source: 'QuantLab Data Integrity Gate',
+        timeframe,
+        dataStatus: 'UNAVAILABLE',
+        isRealData: false,
+        isLiveVerified: false,
+        fetchedAt,
+        warnings: ['Simbolo virtuale di portafoglio: utilizzare le serie reali dei singoli costituenti.'],
+      };
+      return res.status(400).json({
+        ticker,
+        currency: inst.currency,
+        currentPrice: null,
+        timeframe,
+        barsCount: 0,
+        startDate: '',
+        endDate: '',
+        bars: [],
+        isRealData: false,
+        dataStatus: 'UNAVAILABLE',
+        provenance,
+        error: 'Serie storica non disponibile per simboli virtuali di portafoglio.',
+      });
     }
 
     const isOverTwoYears = isRangeOverTwoYearsServer(startDate, endDate);
     let wasAutoAdjustedTo1D = false;
     let autoAdjustmentNote = '';
+    const warnings: string[] = [];
 
-    // RULE: If period is > 2 years, intraday data does not exist in real market feeds (Yahoo limits to 730d).
-    // Automatically force timeframe to 1D (Daily) so real historical data is retrieved without synthetic fallbacks.
     if (isOverTwoYears && timeframe !== '1D') {
       timeframe = '1D';
       wasAutoAdjustedTo1D = true;
-      autoAdjustmentNote = 'Periodo oltre 2 anni rilevato: timeframe impostato automaticamente a 1D (giornaliero) per garantire il 100% di dati storici reali di mercato ed escludere qualsiasi serie sintetica.';
-      console.log(`[MarketHistory] Auto-converted ${ticker} from intraday to 1D because range > 2 years (${startDate} -> ${endDate})`);
-    }
-
-    const { yahooSymbol, isSynthetic } = normalizeYahooTicker(ticker);
-    const inst = getFallbackInstrument(ticker);
-
-    // If synthetic (e.g. PORTFOLIO aggregate), generate deterministic aggregate
-    if (isSynthetic) {
-      const syntheticBars = generateHistoricalBars(inst, timeframe, startDate, endDate);
-      const lastBar = syntheticBars[syntheticBars.length - 1];
-      return res.json({
-        ticker,
-        currency: inst.currency,
-        currentPrice: lastBar?.close ?? inst.currentPrice,
-        timeframe,
-        barsCount: syntheticBars.length,
-        startDate: syntheticBars[0]?.dateStr || '',
-        endDate: lastBar?.dateStr || '',
-        bars: syntheticBars,
-        isRealData: false,
-        source: 'High-Fidelity Quantitative Model',
-      });
+      autoAdjustmentNote =
+        'Periodo oltre 2 anni rilevato: timeframe impostato automaticamente a 1D (giornaliero) per garantire il 100% di dati storici reali senza serie sintetiche.';
+      warnings.push(autoAdjustmentNote);
     }
 
     const cacheKey = `history_${ticker}_${timeframe}_${startDate || 'all'}_${endDate || 'all'}`;
@@ -456,10 +663,8 @@ app.get('/api/market/history', async (req: Request, res: Response) => {
       return res.json({ ...cached.data, _cached: true });
     }
 
-    // Map timeframe to Yahoo Finance interval & range
     let interval = '1d';
     let range = '10y';
-
     switch (timeframe) {
       case '1m':
         interval = '1m';
@@ -478,13 +683,7 @@ app.get('/api/market/history', async (req: Request, res: Response) => {
         range = '60d';
         break;
       case '1h':
-        interval = '1h';
-        range = '730d';
-        break;
       case '2h':
-        interval = '1h';
-        range = '730d';
-        break;
       case '4h':
         interval = '1h';
         range = '730d';
@@ -496,25 +695,31 @@ app.get('/api/market/history', async (req: Request, res: Response) => {
         break;
     }
 
-    // Always use relative `range` query parameter on Yahoo Finance v8 so future container dates never break requests
     let url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=${interval}&range=${range}&includePrePost=false`;
-
     let fetchRes = await fetchYahoo(url);
 
-    // If Yahoo request failed on intraday, retry on 1D (Daily) with range=5y to get real historical data
+    // Explicit fallback ONLY to real 1D bars (never synthetic) if intraday unavailable on exchange
     if ((!fetchRes.ok || !fetchRes.data) && interval !== '1d') {
-      console.warn(`[MarketHistory] ${ticker} non disponibile su intraday (${interval}). Tentativo di recupero automatico su 1D (Daily) reale.`);
       interval = '1d';
       timeframe = '1D';
       wasAutoAdjustedTo1D = true;
-      autoAdjustmentNote = 'Dati intraday non reperibili per il periodo richiesto: timeframe impostato su 1D per garantire dati storici reali.';
+      autoAdjustmentNote =
+        'Dati intraday reali non disponibili dal feed di borsa per questo ticker: timeframe impostato esplicitamente a 1D reale.';
+      warnings.push(autoAdjustmentNote);
       url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1d&range=5y&includePrePost=false`;
       fetchRes = await fetchYahoo(url);
     }
 
-    // STRICT REAL DATA POLICY: never invent synthetic bars if live exchange feed fails
     if (!fetchRes.ok || !fetchRes.data) {
-      console.warn(`[MarketHistory] Ticker ${ticker} temporaneamente non disponibile su feed live (HTTP ${fetchRes.status}).`);
+      const provenance: DataProvenance = {
+        source: 'Yahoo Finance Real-Time Market API',
+        timeframe,
+        dataStatus: 'UNAVAILABLE',
+        isRealData: false,
+        isLiveVerified: false,
+        fetchedAt,
+        warnings: [`Feed di borsa non raggiungibile (HTTP ${fetchRes.status}).`],
+      };
       return res.status(503).json({
         ticker,
         currency: inst.currency,
@@ -525,13 +730,24 @@ app.get('/api/market/history', async (req: Request, res: Response) => {
         endDate: '',
         bars: [],
         isRealData: false,
+        dataStatus: 'UNAVAILABLE',
+        provenance,
         error: 'Dati storici reali temporaneamente non disponibili dal feed di borsa',
         source: 'Exchange Feed Temporarily Unavailable',
       });
     }
 
     const result = fetchRes.data.chart?.result?.[0];
-    if (!result || !result.timestamp || result.timestamp.length === 0) {
+    if (!result || !Array.isArray(result.timestamp) || result.timestamp.length === 0) {
+      const provenance: DataProvenance = {
+        source: 'Yahoo Finance Real-Time Market API',
+        timeframe,
+        dataStatus: 'UNAVAILABLE',
+        isRealData: false,
+        isLiveVerified: false,
+        fetchedAt,
+        warnings: ['Nessuna candela storica restituita dal feed.'],
+      };
       return res.status(503).json({
         ticker,
         currency: inst.currency,
@@ -542,6 +758,8 @@ app.get('/api/market/history', async (req: Request, res: Response) => {
         endDate: '',
         bars: [],
         isRealData: false,
+        dataStatus: 'UNAVAILABLE',
+        provenance,
         error: 'Nessuna candela storica reale restituita per questo ticker',
         source: 'Exchange Feed Empty',
       });
@@ -550,7 +768,14 @@ app.get('/api/market/history', async (req: Request, res: Response) => {
     const timestamps: number[] = result.timestamp;
     const quotes = result.indicators?.quote?.[0];
     if (!quotes) {
-      return res.status(404).json({ error: `No quotes found for ${ticker}` });
+      return res.status(503).json({
+        ticker,
+        bars: [],
+        barsCount: 0,
+        isRealData: false,
+        dataStatus: 'UNAVAILABLE',
+        error: `Dati OHLCV mancanti dal feed per ${ticker}`,
+      });
     }
 
     const opens: (number | null)[] = quotes.open || [];
@@ -559,157 +784,197 @@ app.get('/api/market/history', async (req: Request, res: Response) => {
     const closes: (number | null)[] = quotes.close || [];
     const volumes: (number | null)[] = quotes.volume || [];
 
-    const rawBars: Array<{
-      timestamp: number;
-      dateStr: string;
-      open: number;
-      high: number;
-      low: number;
-      close: number;
-      volume: number;
-    }> = [];
-
-    let lastValidClose = result.meta?.previousClose ?? 10;
-
+    const rawBars: Bar[] = [];
     for (let i = 0; i < timestamps.length; i++) {
-      const t = timestamps[i] * 1000;
-      let c = closes[i];
-      let o = opens[i];
-      let h = highs[i];
-      let l = lows[i];
-      let v = volumes[i] ?? 0;
-
-      // Skip nulls or fill forward if close is missing
-      if (c == null || isNaN(c)) {
-        if (lastValidClose != null) {
-          c = lastValidClose;
-        } else {
-          continue;
-        }
-      } else {
-        lastValidClose = c;
+      const tsSec = timestamps[i];
+      const c = closes[i];
+      if (!Number.isFinite(tsSec) || typeof c !== 'number' || !Number.isFinite(c) || c <= 0) {
+        // Never invent or forward-fill missing exchange bars
+        continue;
       }
+      const o = typeof opens[i] === 'number' && Number.isFinite(opens[i]!) && opens[i]! > 0 ? opens[i]! : c;
+      const hRaw = typeof highs[i] === 'number' && Number.isFinite(highs[i]!) && highs[i]! > 0 ? highs[i]! : Math.max(o, c);
+      const lRaw = typeof lows[i] === 'number' && Number.isFinite(lows[i]!) && lows[i]! > 0 ? lows[i]! : Math.min(o, c);
+      const v = typeof volumes[i] === 'number' && Number.isFinite(volumes[i]!) && volumes[i]! >= 0 ? volumes[i]! : 0;
 
-      if (o == null || isNaN(o)) o = c;
-      if (h == null || isNaN(h)) h = Math.max(o, c);
-      if (l == null || isNaN(l)) l = Math.min(o, c);
-
-      const d = new Date(t);
+      const tMs = tsSec * 1000;
+      const d = new Date(tMs);
       const dateStr =
-        timeframe === '1D'
+        interval === '1d'
           ? d.toISOString().substring(0, 10)
-          : `${d.toISOString().substring(0, 10)} ${d.toTimeString().substring(0, 5)}`;
+          : `${d.toISOString().substring(0, 10)} ${d.toISOString().substring(11, 16)}`;
 
       rawBars.push({
-        timestamp: t,
+        timestamp: tMs,
         dateStr,
         open: parseFloat(o.toFixed(4)),
-        high: parseFloat(Math.max(h, o, c).toFixed(4)),
-        low: parseFloat(Math.min(l, o, c).toFixed(4)),
+        high: parseFloat(Math.max(hRaw, o, c).toFixed(4)),
+        low: parseFloat(Math.min(lRaw, o, c).toFixed(4)),
         close: parseFloat(c.toFixed(4)),
         volume: Math.round(v),
       });
     }
 
-    // If 4h requested, aggregate 4 hourly bars into 1 4h bar
-    let finalBars = rawBars;
-    if (timeframe === '4h' && rawBars.length > 0) {
-      const aggBars: typeof rawBars = [];
-      const chunkSize = 4;
-      for (let i = 0; i < rawBars.length; i += chunkSize) {
-        const chunk = rawBars.slice(i, i + chunkSize);
-        if (chunk.length === 0) continue;
-        const open = chunk[0].open;
-        const close = chunk[chunk.length - 1].close;
-        const high = Math.max(...chunk.map((b) => b.high));
-        const low = Math.min(...chunk.map((b) => b.low));
-        const volume = chunk.reduce((sum, b) => sum + b.volume, 0);
-        const timestamp = chunk[chunk.length - 1].timestamp;
-        const dateStr = chunk[chunk.length - 1].dateStr;
-        aggBars.push({ timestamp, dateStr, open, high, low, close, volume });
-      }
-      finalBars = aggBars;
+    const meta = result.meta || {};
+    const exchangeTimezone: string | undefined = meta.exchangeTimezoneName || undefined;
+
+    // Clean, sort, deduplicate, and exclude currently-forming incomplete bar
+    const baseTf: Timeframe = interval === '1h' ? '1h' : timeframe;
+    const cleanedBase = validateAndCleanBars(rawBars, baseTf, {
+      excludeIncompleteLastBar: true,
+    });
+    warnings.push(...cleanedBase.quality.warnings);
+
+    // Properly aggregate 2h and 4h respecting session days & timezone boundaries
+    let finalBars: Bar[] = cleanedBase.bars;
+    let finalQuality = cleanedBase.quality;
+    if ((timeframe === '2h' || timeframe === '4h') && interval === '1h') {
+      const aggregated = aggregateHourlyBars(cleanedBase.bars, timeframe, {
+        exchangeTimezone,
+      });
+      warnings.push(...aggregated.warnings);
+      const cleanedAgg = validateAndCleanBars(aggregated.bars, timeframe, {
+        excludeIncompleteLastBar: false,
+      });
+      finalBars = cleanedAgg.bars;
+      finalQuality = cleanedAgg.quality;
     }
 
-    // If startDate / endDate specified, filter final bars to match user request
+    // Filter to explicit user date range if specified
     if (startDate || endDate) {
       const filterStartMs = startDate ? new Date(`${startDate}T00:00:00Z`).getTime() : 0;
       const filterEndMs = endDate ? new Date(`${endDate}T23:59:59Z`).getTime() : Infinity;
-      const filtered = finalBars.filter((b) => b.timestamp >= filterStartMs && b.timestamp <= filterEndMs);
-
-      // Verify the returned bars actually cover the requested start date within a reasonable margin
-      const reqStartYear = startDate ? new Date(startDate).getUTCFullYear() : null;
-      const oldestBarYear = filtered.length > 0 ? new Date(filtered[0].timestamp).getUTCFullYear() : null;
-      const spansRequestedStart = !reqStartYear || !oldestBarYear || oldestBarYear <= reqStartYear + 1;
-
-      if (filtered.length >= 5) {
+      const filtered = finalBars.filter(
+        (b) => b.timestamp >= filterStartMs && b.timestamp <= filterEndMs
+      );
+      if (filtered.length > 0) {
         finalBars = filtered;
+      } else {
+        warnings.push(
+          `Nessuna barra reale trovata esattamente tra ${startDate || '...'} e ${endDate || '...'}: restituita serie storica reale disponibile del feed.`
+        );
       }
     }
 
-    const meta = result.meta;
+    if (finalBars.length === 0) {
+      const provenance: DataProvenance = {
+        source: 'Yahoo Finance Real-Time Market API',
+        timeframe,
+        dataStatus: 'UNAVAILABLE',
+        isRealData: false,
+        isLiveVerified: false,
+        fetchedAt,
+        exchangeTimezone,
+        quality: finalQuality,
+        warnings: [...warnings, 'Nessuna barra valida dopo la validazione di integrità.'],
+      };
+      return res.status(503).json({
+        ticker: meta.symbol || ticker,
+        currency: meta.currency || inst.currency,
+        currentPrice: null,
+        timeframe,
+        barsCount: 0,
+        startDate: '',
+        endDate: '',
+        bars: [],
+        isRealData: false,
+        dataStatus: 'UNAVAILABLE',
+        provenance,
+        error: 'Nessuna barra OHLCV valida disponibile per questo strumento/timeframe.',
+      });
+    }
+
+    const resolvedCurrency = (meta.currency || inst.currency || 'USD').toUpperCase();
+    const provenance: DataProvenance = {
+      source:
+        timeframe === '2h' || timeframe === '4h'
+          ? `Yahoo Finance 1h Real Bars → Session-Aware ${timeframe} Aggregation`
+          : 'Yahoo Finance Real-Time Market API',
+      timeframe,
+      dataStatus: 'HISTORICAL_REAL',
+      isRealData: true,
+      isLiveVerified: true,
+      fetchedAt,
+      currency: resolvedCurrency,
+      exchangeTimezone,
+      quality: finalQuality,
+      warnings,
+    };
+
     const responsePayload = {
       ticker: meta.symbol || ticker,
-      currency: meta.currency || 'EUR',
-      currentPrice: meta.regularMarketPrice ?? finalBars[finalBars.length - 1]?.close ?? 0,
+      currency: resolvedCurrency,
+      currentPrice:
+        typeof meta.regularMarketPrice === 'number' && meta.regularMarketPrice > 0
+          ? parseFloat(meta.regularMarketPrice.toFixed(4))
+          : finalBars[finalBars.length - 1].close,
       timeframe,
       barsCount: finalBars.length,
       startDate: finalBars[0]?.dateStr || '',
       endDate: finalBars[finalBars.length - 1]?.dateStr || '',
       bars: finalBars,
       isRealData: true,
+      dataStatus: 'HISTORICAL_REAL' as DataStatus,
+      provenance,
       autoAdjustedTimeframe: wasAutoAdjustedTo1D ? '1D' : undefined,
       autoAdjustmentNote: wasAutoAdjustedTo1D ? autoAdjustmentNote : undefined,
-      source: 'Yahoo Finance Real-Time Market API',
+      source: provenance.source,
     };
 
     cache.set(cacheKey, { timestamp: Date.now(), data: responsePayload });
     res.json(responsePayload);
   } catch (err: any) {
-    console.warn('[MarketHistory] Avviso elaborazione storico reale, attivazione fallback:', err?.message || err);
-    try {
-      const inst = getFallbackInstrument((req.query.ticker as string || 'ASSET').trim().toUpperCase());
-      const tf = (req.query.timeframe as string || '1D') as Timeframe;
-      const fallbackBars = generateHistoricalBars(inst, tf, req.query.startDate as string, req.query.endDate as string);
-      const lastBar = fallbackBars[fallbackBars.length - 1];
-      return res.json({
-        ticker: inst.ticker,
-        currency: inst.currency,
-        currentPrice: lastBar?.close ?? inst.currentPrice,
-        timeframe: tf,
-        barsCount: fallbackBars.length,
-        startDate: fallbackBars[0]?.dateStr || '',
-        endDate: lastBar?.dateStr || '',
-        bars: fallbackBars,
+    console.error('[MarketHistory] Errore acquisizione dati storici reali:', err?.message || err);
+    return res.status(503).json({
+      ticker: String(req.query.ticker || '').trim().toUpperCase(),
+      currency: null,
+      currentPrice: null,
+      timeframe: String(req.query.timeframe || '1D'),
+      barsCount: 0,
+      startDate: '',
+      endDate: '',
+      bars: [],
+      isRealData: false,
+      dataStatus: 'UNAVAILABLE' as DataStatus,
+      error: 'Errore imprevisto nel recupero dei dati storici reali. Nessun dato sintetico generato.',
+      provenance: {
+        source: 'Yahoo Finance Real-Time Market API',
+        timeframe: (req.query.timeframe as Timeframe) || '1D',
+        dataStatus: 'UNAVAILABLE',
         isRealData: false,
-        source: 'High-Fidelity Quantitative Model (Live Feed Fallback)',
-      });
-    } catch {
-      return res.status(200).json({
-        ticker: req.query.ticker || 'ASSET',
-        currency: 'USD',
-        currentPrice: 100,
-        timeframe: req.query.timeframe || '1D',
-        barsCount: 0,
-        startDate: '',
-        endDate: '',
-        bars: [],
-        isRealData: false,
-      });
-    }
+        isLiveVerified: false,
+        fetchedAt,
+        warnings: ['Errore interno durante l’elaborazione del feed reale.'],
+      } satisfies DataProvenance,
+    });
   }
 });
 
-// Real-Time Market Intelligence & News Feed
+// Real-Time Market Intelligence & News Feed (ZERO fabricated articles)
 app.get('/api/market/intelligence', async (req: Request, res: Response) => {
   try {
-    const ticker = (req.query.ticker as string || '').trim().toUpperCase();
-    const timeframe = (req.query.timeframe as string || '1D');
-    if (!ticker) {
-      return res.status(400).json({ error: 'Ticker is required' });
+    const tickerCheck = validateTicker(req.query.ticker);
+    if (!tickerCheck.ok) {
+      return res.status(400).json({ error: tickerCheck.error });
+    }
+    const ticker = tickerCheck.value;
+    const timeframe = String(req.query.timeframe || '1D');
+
+    const { yahooSymbol, isVirtual } = normalizeYahooTicker(ticker);
+    if (isVirtual) {
+      return res.json({
+        ticker,
+        yahooSymbol: '',
+        timeframe,
+        news: [],
+        quoteSummary: null,
+        newsStatus: 'UNAVAILABLE',
+        isRealNews: true,
+        dataQuality: 'UNAVAILABLE',
+        timestamp: new Date().toISOString(),
+      });
     }
 
-    const { yahooSymbol } = normalizeYahooTicker(ticker);
     const cacheKey = `intel_${yahooSymbol}_${timeframe}`;
     const cached = cache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < 3 * 60 * 1000) {
@@ -718,26 +983,25 @@ app.get('/api/market/intelligence', async (req: Request, res: Response) => {
 
     let newsItems: any[] = [];
     let quoteSummaryData: any = null;
-    let dataQuality = 'HIGH';
 
-    const inst = getFallbackInstrument(ticker);
+    const inst = getInstrumentMeta(ticker);
     const companyKeywords = [
       ticker.toLowerCase(),
       yahooSymbol.toLowerCase(),
       ticker.split('.')[0].toLowerCase(),
-      ...inst.name.toLowerCase().split(/[\s,()]+/).filter(w => w.length > 3 && !['ucits', 'etf', 'acc', 'dist', 'shares', 'trust'].includes(w)),
+      ...inst.name
+        .toLowerCase()
+        .split(/[\s,()]+/)
+        .filter((w) => w.length > 3 && !['ucits', 'etf', 'acc', 'dist', 'shares', 'trust'].includes(w)),
     ];
 
-    // 1. Fetch real news articles from Yahoo Finance search API
     try {
       const searchNewsUrl = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(yahooSymbol)}&quotesCount=1&newsCount=20`;
       const searchRes = await fetchYahoo(searchNewsUrl);
       if (searchRes.ok && searchRes.data && Array.isArray(searchRes.data.news)) {
-        // Strict relevance filter: news MUST mention the ticker, symbol or company name
         const rawNews = searchRes.data.news;
         newsItems = rawNews.filter((item: any) => {
           const t = (item.title || '').toLowerCase();
-          const p = (item.publisher || '').toLowerCase();
           const rel = Array.isArray(item.relatedTickers)
             ? item.relatedTickers.map((r: string) => r.toUpperCase())
             : [];
@@ -747,66 +1011,20 @@ app.get('/api/market/intelligence', async (req: Request, res: Response) => {
       }
     } catch (e) {
       console.warn('[MarketIntelligence] Yahoo search news query error:', e);
-      dataQuality = 'MEDIUM';
     }
 
-    // 2. Fetch quote summary if available for consensus, calendars & profile
     try {
       const summaryUrl = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(yahooSymbol)}?modules=summaryProfile,financialData,defaultKeyStatistics,recommendationTrend,calendarEvents`;
       const summaryRes = await fetchYahoo(summaryUrl);
       if (summaryRes.ok && summaryRes.data?.quoteSummary?.result?.[0]) {
         quoteSummaryData = summaryRes.data.quoteSummary.result[0];
       }
-    } catch (e) {
-      // Non-critical, fallback to standard corporate profile
+    } catch {
+      // Non-critical
     }
 
-    // 3. If Yahoo returned fewer than 2 relevant news for this specific asset, provide rich, asset-specific verified intelligence
-    if (newsItems.length < 2) {
-      const isETF = inst.type === 'ETF';
-      const sectorName = inst.sector || 'Mercati Finanziari';
-      const cleanName = inst.name.replace(/\([^)]*\)/g, '').trim();
-
-      newsItems = [
-        {
-          uuid: `news-1-${ticker.toLowerCase()}`,
-          title: isETF
-            ? `${ticker} (${cleanName}): Aggiornamento flussi e composizione indice di riferimento nel settore ${sectorName}`
-            : `${ticker} (${cleanName}): Dati operativi trimestrali, margini ed evoluzione dei flussi di cassa in focus`,
-          publisher: 'Reuters',
-          link: `https://finance.yahoo.com/quote/${encodeURIComponent(yahooSymbol)}`,
-          providerPublishTime: Math.floor((Date.now() - 3600 * 1000 * 3) / 1000),
-          type: 'ARTICLE',
-        },
-        {
-          uuid: `news-2-${ticker.toLowerCase()}`,
-          title: isETF
-            ? `Analisi allocazione e tracking error per ${ticker} in contesto di tassi e rotazione azionaria`
-            : `${ticker}: Revisione target price e consenso analisti in vista del prossimo esercizio finanziario`,
-          publisher: 'Bloomberg',
-          link: `https://finance.yahoo.com/quote/${encodeURIComponent(yahooSymbol)}`,
-          providerPublishTime: Math.floor((Date.now() - 3600 * 1000 * 11) / 1000),
-          type: 'ARTICLE',
-        },
-        {
-          uuid: `news-3-${ticker.toLowerCase()}`,
-          title: `${cleanName} (${ticker}): Volatilità implicita e posizionamento istituzionale sul mercato ${inst.market}`,
-          publisher: 'The Wall Street Journal',
-          link: `https://finance.yahoo.com/quote/${encodeURIComponent(yahooSymbol)}`,
-          providerPublishTime: Math.floor((Date.now() - 3600 * 1000 * 22) / 1000),
-          type: 'ARTICLE',
-        },
-        {
-          uuid: `news-4-${ticker.toLowerCase()}`,
-          title: `Quadro macroeconomico e dinamiche del settore ${sectorName}: impatto sulle prospettive di ${ticker}`,
-          publisher: 'Financial Times',
-          link: `https://finance.yahoo.com/quote/${encodeURIComponent(yahooSymbol)}`,
-          providerPublishTime: Math.floor((Date.now() - 3600 * 1000 * 46) / 1000),
-          type: 'ARTICLE',
-        },
-      ];
-      dataQuality = newsItems.length > 0 ? 'HIGH' : 'MEDIUM';
-    }
+    const newsStatus = newsItems.length > 0 ? 'LIVE_VERIFIED' : 'UNAVAILABLE';
+    const dataQuality = newsItems.length >= 2 ? 'HIGH' : newsItems.length > 0 ? 'MEDIUM' : 'UNAVAILABLE';
 
     const payload = {
       ticker,
@@ -814,6 +1032,8 @@ app.get('/api/market/intelligence', async (req: Request, res: Response) => {
       timeframe,
       news: newsItems,
       quoteSummary: quoteSummaryData,
+      newsStatus,
+      isRealNews: true,
       dataQuality,
       timestamp: new Date().toISOString(),
     };
@@ -821,21 +1041,22 @@ app.get('/api/market/intelligence', async (req: Request, res: Response) => {
     cache.set(cacheKey, { timestamp: Date.now(), data: payload });
     res.json(payload);
   } catch (err: any) {
-    console.warn('[MarketIntelligence] Fallback graceful error handling:', err?.message || err);
-    res.json({
-      ticker: req.query.ticker || 'ASSET',
+    console.warn('[MarketIntelligence] Errore recupero notizie reali:', err?.message || err);
+    res.status(503).json({
+      ticker: String(req.query.ticker || '').trim().toUpperCase(),
       news: [],
-      dataQuality: 'LOW',
+      newsStatus: 'UNAVAILABLE',
+      isRealNews: true,
+      dataQuality: 'UNAVAILABLE',
       timestamp: new Date().toISOString(),
     });
   }
 });
 
-
 // Search Tickers
 app.get('/api/market/search', async (req: Request, res: Response) => {
   try {
-    const q = (req.query.q as string || '').trim();
+    const q = String(req.query.q || '').trim().slice(0, 64);
     if (!q) {
       return res.json({ results: [] });
     }
@@ -845,7 +1066,11 @@ app.get('/api/market/search', async (req: Request, res: Response) => {
     const quotes = fetchRes.ok ? fetchRes.data?.quotes || [] : [];
 
     const results = quotes
-      .filter((item: any) => item.symbol && (item.quoteType === 'EQUITY' || item.quoteType === 'ETF' || item.quoteType === 'MUTUALFUND'))
+      .filter(
+        (item: any) =>
+          item.symbol &&
+          (item.quoteType === 'EQUITY' || item.quoteType === 'ETF' || item.quoteType === 'MUTUALFUND')
+      )
       .map((item: any) => ({
         symbol: item.symbol,
         name: item.shortname || item.longname || item.symbol,
@@ -861,123 +1086,255 @@ app.get('/api/market/search', async (req: Request, res: Response) => {
   }
 });
 
-// Paper Trading 24/7 Cloud Background Routes
+// -------------------------------------------------------------
+// Paper Trading 24/7 Cloud Background Routes (Authenticated Mutations)
+// -------------------------------------------------------------
 app.get('/api/paper/sessions', (_req: Request, res: Response) => {
   try {
     const sessions = serverPaperTradingEngine.getAllSessions();
     const deletedSessionIds = serverPaperTradingEngine.getDeletedSessionIds();
     res.json({ sessions, deletedSessionIds });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to fetch sessions' });
+    res.status(500).json({ error: err?.message || 'Failed to fetch sessions' });
   }
 });
 
-app.post('/api/paper/sessions', async (req: Request, res: Response) => {
-  try {
-    const config = req.body;
-    if (!config || !config.strategyId || !config.instrument) {
-      return res.status(400).json({ error: 'Configurazione sessione incompleta' });
+app.post(
+  '/api/paper/sessions',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const config = req.body;
+      if (!config || typeof config.strategyId !== 'string' || !config.instrument?.ticker) {
+        return res.status(400).json({ error: 'Configurazione sessione incompleta' });
+      }
+      const tickerCheck = validateTicker(config.instrument.ticker);
+      if (!tickerCheck.ok) {
+        return res.status(400).json({ error: tickerCheck.error });
+      }
+      const capitalCheck = validateFiniteNumber(
+        config.initialCapital ?? 10000,
+        'initialCapital',
+        100,
+        10_000_000
+      );
+      if (!capitalCheck.ok) {
+        return res.status(400).json({ error: capitalCheck.error });
+      }
+      const tfCheck = validateTimeframe(config.timeframe || '1h');
+      if (!tfCheck.ok) {
+        return res.status(400).json({ error: tfCheck.error });
+      }
+
+      const session = await serverPaperTradingEngine.createSession({
+        ...config,
+        timeframe: tfCheck.value,
+        initialCapital: capitalCheck.value,
+      });
+      if (req.authUser?.uid) {
+        session.ownerUid = req.authUser.uid;
+      }
+      res.status(201).json({ session });
+    } catch (err: any) {
+      console.error('Error creating paper session:', err);
+      res.status(500).json({ error: err?.message || 'Failed to create session' });
     }
-    const session = await serverPaperTradingEngine.createSession(config);
-    res.status(201).json({ session });
-  } catch (err: any) {
-    console.error('Error creating paper session:', err);
-    res.status(500).json({ error: err.message || 'Failed to create session' });
   }
-});
+);
 
 app.get('/api/paper/sessions/:id', (req: Request, res: Response) => {
-  const session = serverPaperTradingEngine.getSession(req.params.id);
+  const idCheck = validateSafeId(req.params.id, 'sessionId');
+  if (!idCheck.ok) return res.status(400).json({ error: idCheck.error });
+  const session = serverPaperTradingEngine.getSession(idCheck.value);
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
   }
   res.json({ session });
 });
 
-app.post('/api/paper/sessions/:id/pause', async (req: Request, res: Response) => {
-  try {
-    const updated = await serverPaperTradingEngine.togglePauseSession(req.params.id);
-    if (!updated) return res.status(404).json({ error: 'Session not found' });
-    res.json({ session: updated });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+app.post(
+  '/api/paper/sessions/:id/pause',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idCheck = validateSafeId(req.params.id, 'sessionId');
+      if (!idCheck.ok) return res.status(400).json({ error: idCheck.error });
+      const existing = serverPaperTradingEngine.getSession(idCheck.value);
+      if (!existing) return res.status(404).json({ error: 'Session not found' });
+      if (!checkSessionOwnership(existing, req)) {
+        return res.status(403).json({ error: 'Permessi insufficienti per questa sessione.' });
+      }
+      const updated = await serverPaperTradingEngine.togglePauseSession(idCheck.value);
+      if (!updated) return res.status(404).json({ error: 'Session not found' });
+      res.json({ session: updated });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore pausa sessione' });
+    }
   }
-});
+);
 
-app.post('/api/paper/sessions/:id/stop', async (req: Request, res: Response) => {
-  try {
-    const updated = await serverPaperTradingEngine.stopSession(req.params.id);
-    if (!updated) return res.status(404).json({ error: 'Session not found' });
-    res.json({ session: updated });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+app.post(
+  '/api/paper/sessions/:id/stop',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idCheck = validateSafeId(req.params.id, 'sessionId');
+      if (!idCheck.ok) return res.status(400).json({ error: idCheck.error });
+      const existing = serverPaperTradingEngine.getSession(idCheck.value);
+      if (!existing) return res.status(404).json({ error: 'Session not found' });
+      if (!checkSessionOwnership(existing, req)) {
+        return res.status(403).json({ error: 'Permessi insufficienti per questa sessione.' });
+      }
+      const updated = await serverPaperTradingEngine.stopSession(idCheck.value);
+      if (!updated) return res.status(404).json({ error: 'Session not found' });
+      res.json({ session: updated });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore arresto sessione' });
+    }
   }
-});
+);
 
-app.delete('/api/paper/sessions/:id', async (req: Request, res: Response) => {
-  try {
-    const success = await serverPaperTradingEngine.deleteSession(req.params.id);
-    res.json({ success });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+app.delete(
+  '/api/paper/sessions/:id',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idCheck = validateSafeId(req.params.id, 'sessionId');
+      if (!idCheck.ok) return res.status(400).json({ error: idCheck.error });
+      const existing = serverPaperTradingEngine.getSession(idCheck.value);
+      if (existing && !checkSessionOwnership(existing, req)) {
+        return res.status(403).json({ error: 'Permessi insufficienti per eliminare questa sessione.' });
+      }
+      const success = await serverPaperTradingEngine.deleteSession(idCheck.value);
+      res.json({ success });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore eliminazione sessione' });
+    }
   }
-});
+);
 
-app.post('/api/paper/sessions/:id/close-position', async (req: Request, res: Response) => {
-  try {
-    const { positionId, currentPrice } = req.body;
-    const updated = await serverPaperTradingEngine.manualClosePosition(req.params.id, positionId, Number(currentPrice));
-    if (!updated) return res.status(404).json({ error: 'Position or session not found' });
-    res.json({ session: updated });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// SECURITY: Authoritative server-side position closure — NEVER trusts client-supplied price!
+app.post(
+  '/api/paper/sessions/:id/close-position',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idCheck = validateSafeId(req.params.id, 'sessionId');
+      if (!idCheck.ok) return res.status(400).json({ error: idCheck.error });
+      const posCheck = validateSafeId(req.body?.positionId, 'positionId');
+      if (!posCheck.ok) return res.status(400).json({ error: posCheck.error });
 
-app.post('/api/paper/sessions/:id/read-alert', async (req: Request, res: Response) => {
-  try {
-    const { alertId } = req.body;
-    await serverPaperTradingEngine.markAlertAsRead(req.params.id, alertId);
-    res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+      const existing = serverPaperTradingEngine.getSession(idCheck.value);
+      if (!existing) return res.status(404).json({ error: 'Session not found' });
+      if (!checkSessionOwnership(existing, req)) {
+        return res.status(403).json({ error: 'Permessi insufficienti per chiudere posizioni in questa sessione.' });
+      }
 
-app.post('/api/paper/sessions/:id/step', async (req: Request, res: Response) => {
-  try {
-    const updated = await serverPaperTradingEngine.stepSession(req.params.id);
-    if (!updated) return res.status(404).json({ error: 'Session not found' });
-    res.json({ session: updated });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+      // Intentionally ignores req.body.currentPrice; server fetches verified live market quote + FX.
+      const result = await serverPaperTradingEngine.manualClosePosition(
+        idCheck.value,
+        posCheck.value
+      );
+      if (!result.ok || !result.session) {
+        const statusCode = result.error?.includes('non trovata') ? 404 : 422;
+        return res.status(statusCode).json({ error: result.error || 'Chiusura posizione non riuscita' });
+      }
+      res.json({ session: result.session });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore chiusura posizione' });
+    }
   }
-});
+);
+
+app.post(
+  '/api/paper/sessions/:id/read-alert',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idCheck = validateSafeId(req.params.id, 'sessionId');
+      if (!idCheck.ok) return res.status(400).json({ error: idCheck.error });
+      const alertCheck = validateSafeId(req.body?.alertId, 'alertId');
+      if (!alertCheck.ok) return res.status(400).json({ error: alertCheck.error });
+      await serverPaperTradingEngine.markAlertAsRead(idCheck.value, alertCheck.value);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore lettura alert' });
+    }
+  }
+);
+
+app.post(
+  '/api/paper/sessions/:id/step',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idCheck = validateSafeId(req.params.id, 'sessionId');
+      if (!idCheck.ok) return res.status(400).json({ error: idCheck.error });
+      const existing = serverPaperTradingEngine.getSession(idCheck.value);
+      if (!existing) return res.status(404).json({ error: 'Session not found' });
+      if (!checkSessionOwnership(existing, req)) {
+        return res.status(403).json({ error: 'Permessi insufficienti per questa sessione.' });
+      }
+      const updated = await serverPaperTradingEngine.stepSession(idCheck.value);
+      if (!updated) return res.status(404).json({ error: 'Session not found' });
+      res.json({ session: updated });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore step sessione' });
+    }
+  }
+);
 
 app.get('/api/paper/status', (_req: Request, res: Response) => {
   res.json(serverPaperTradingEngine.getServerStatus());
 });
 
-app.post('/api/paper/consolidate', async (_req: Request, res: Response) => {
-  try {
-    const result = await serverPaperTradingEngine.consolidateSingleSessionsIntoPortfolio();
-    res.json(result);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Errore durante il consolidamento' });
+app.post(
+  '/api/paper/consolidate',
+  mutationRateLimiter,
+  requireAuth(),
+  async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const result = await serverPaperTradingEngine.consolidateSingleSessionsIntoPortfolio();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore durante il consolidamento' });
+    }
   }
-});
+);
 
-// Clean Reset & Start AI Dynamic Swing Portfolio
-app.post('/api/paper/reset-clean', async (req: Request, res: Response) => {
-  try {
-    const result = await serverPaperTradingEngine.resetCleanAndStartAiSwingPortfolio(req.body || {});
-    res.json(result);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Errore durante il reset pulito' });
+app.post(
+  '/api/paper/reset-clean',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const body = req.body || {};
+      if (body.initialCapital !== undefined) {
+        const capCheck = validateFiniteNumber(body.initialCapital, 'initialCapital', 500, 10_000_000);
+        if (!capCheck.ok) return res.status(400).json({ error: capCheck.error });
+      }
+      if (body.timeframe !== undefined) {
+        const tfCheck = validateTimeframe(body.timeframe);
+        if (!tfCheck.ok) return res.status(400).json({ error: tfCheck.error });
+      }
+      const result = await serverPaperTradingEngine.resetCleanAndStartAiSwingPortfolio(body);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore durante il reset pulito' });
+    }
   }
-});
+);
 
-// AI Dynamic Opportunity Scanner (Swing 1h-4h for Steady Monthly Gains)
+// -------------------------------------------------------------
+// AI Dynamic Opportunity Scanner (100% Real Verified Bars & Live FX)
+// -------------------------------------------------------------
 const SCANNER_UNIVERSE = [
   'NVDA',
   'AAPL',
@@ -996,85 +1353,81 @@ const SCANNER_UNIVERSE = [
 ];
 
 async function runAiDynamicScanner(timeframe: Timeframe = '1h', useGeminiAi = false) {
-  const eurUsdRate = await getLiveEurUsdRate();
+  const fx = await getLiveEurUsdFx();
   const opportunities: any[] = [];
 
   await Promise.all(
     SCANNER_UNIVERSE.map(async (ticker) => {
       try {
-        const inst = getFallbackInstrument(ticker);
+        const inst = getInstrumentMeta(ticker);
         const { yahooSymbol } = normalizeYahooTicker(ticker);
-        const isEur = ticker.endsWith('.MI') || ticker.endsWith('.DE') || ticker.endsWith('.PA') || ticker.endsWith('.AS');
+        const isEur =
+          ticker.endsWith('.MI') ||
+          ticker.endsWith('.DE') ||
+          ticker.endsWith('.PA') ||
+          ticker.endsWith('.AS');
         const currency = isEur ? 'EUR' : 'USD';
         const currencySymbol = isEur ? '€' : '$';
-        const fxRateToEur = isEur ? 1.0 : parseFloat((1 / eurUsdRate).toFixed(4));
+        const { fxRateToEur, fxVerified } = resolveCurrencyFx(currency, fx);
 
-        // Fetch 1h bars from Yahoo (range=60d)
         const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1h&range=60d&includePrePost=false`;
         const fetchRes = await fetchYahoo(url, 6000);
         const result = fetchRes.ok ? fetchRes.data?.chart?.result?.[0] : null;
 
-        let bars: Array<{ timestamp: number; open: number; high: number; low: number; close: number; volume: number }> = [];
-        let livePrice = inst.currentPrice;
-        let change24hPct = inst.change24h || 0;
-        let isLiveVerified = false;
-
-        if (result && result.timestamp && result.timestamp.length >= 25) {
-          const ts: number[] = result.timestamp;
-          const q = result.indicators?.quote?.[0] || {};
-          let lastClose = result.meta?.regularMarketPrice || inst.currentPrice;
-
-          for (let i = 0; i < ts.length; i++) {
-            const c = q.close?.[i] ?? lastClose;
-            if (c == null || isNaN(c)) continue;
-            lastClose = c;
-            bars.push({
-              timestamp: ts[i] * 1000,
-              open: q.open?.[i] ?? c,
-              high: q.high?.[i] ?? c,
-              low: q.low?.[i] ?? c,
-              close: parseFloat(c.toFixed(4)),
-              volume: q.volume?.[i] ?? 0,
-            });
-          }
-
-          if (timeframe === '4h' && bars.length >= 16) {
-            const agg: typeof bars = [];
-            for (let i = 0; i < bars.length; i += 4) {
-              const chunk = bars.slice(i, i + 4);
-              if (!chunk.length) continue;
-              agg.push({
-                timestamp: chunk[chunk.length - 1].timestamp,
-                open: chunk[0].open,
-                high: Math.max(...chunk.map((b) => b.high)),
-                low: Math.min(...chunk.map((b) => b.low)),
-                close: chunk[chunk.length - 1].close,
-                volume: chunk.reduce((s, b) => s + b.volume, 0),
-              });
-            }
-            bars = agg;
-          }
-
-          livePrice = result.meta?.regularMarketPrice ?? bars[bars.length - 1]?.close ?? 0;
-          if (!livePrice || livePrice <= 0) return;
-          const prevClose = result.meta?.chartPreviousClose ?? result.meta?.previousClose ?? (bars.length > 7 ? bars[bars.length - 8].close : livePrice);
-          change24hPct = prevClose > 0 ? ((livePrice - prevClose) / prevClose) * 100 : 0;
-          isLiveVerified = true;
-        } else {
-          // Strict real-data rule: skip any ticker whose live bars could not be verified
+        if (!result || !Array.isArray(result.timestamp) || result.timestamp.length < 25) {
           return;
         }
+
+        const ts: number[] = result.timestamp;
+        const q = result.indicators?.quote?.[0] || {};
+        const rawBars: Bar[] = [];
+        for (let i = 0; i < ts.length; i++) {
+          const c = q.close?.[i];
+          if (typeof c !== 'number' || !Number.isFinite(c) || c <= 0) continue;
+          const o = typeof q.open?.[i] === 'number' && q.open[i] > 0 ? q.open[i] : c;
+          const h = typeof q.high?.[i] === 'number' && q.high[i] > 0 ? q.high[i] : Math.max(o, c);
+          const l = typeof q.low?.[i] === 'number' && q.low[i] > 0 ? q.low[i] : Math.min(o, c);
+          const tMs = ts[i] * 1000;
+          const d = new Date(tMs);
+          rawBars.push({
+            timestamp: tMs,
+            dateStr: `${d.toISOString().substring(0, 10)} ${d.toISOString().substring(11, 16)}`,
+            open: parseFloat(o.toFixed(4)),
+            high: parseFloat(Math.max(h, o, c).toFixed(4)),
+            low: parseFloat(Math.min(l, o, c).toFixed(4)),
+            close: parseFloat(c.toFixed(4)),
+            volume: Math.round(q.volume?.[i] ?? 0),
+          });
+        }
+
+        const cleaned = validateAndCleanBars(rawBars, '1h', { excludeIncompleteLastBar: true });
+        let bars = cleaned.bars;
+        if ((timeframe === '2h' || timeframe === '4h') && bars.length >= 16) {
+          bars = aggregateHourlyBars(bars, timeframe, {
+            exchangeTimezone: result.meta?.exchangeTimezoneName,
+          }).bars;
+        }
+
+        if (bars.length < 20) return;
+
+        const livePrice = result.meta?.regularMarketPrice ?? bars[bars.length - 1]?.close ?? 0;
+        if (!Number.isFinite(livePrice) || livePrice <= 0) return;
+        const prevClose =
+          result.meta?.chartPreviousClose ??
+          result.meta?.previousClose ??
+          (bars.length > 7 ? bars[bars.length - 8].close : livePrice);
+        const change24hPct = prevClose > 0 ? ((livePrice - prevClose) / prevClose) * 100 : 0;
 
         const closes = bars.map((b) => b.close);
         const ema20Arr = calculateEMA(closes, 20);
         const ema50Arr = calculateEMA(closes, Math.min(50, Math.max(10, closes.length - 2)));
         const rsiArr = calculateRSI(closes, 14);
-        const atrArr = calculateATR(bars as any, 14);
+        const atrArr = calculateATR(bars, 14);
 
         const ema20 = ema20Arr[ema20Arr.length - 1] ?? livePrice;
         const ema20Prev = ema20Arr[ema20Arr.length - 2] ?? ema20;
-        const ema50 = ema50Arr[ema50Arr.length - 1] ?? livePrice * 0.99;
-        const rsi14 = rsiArr[rsiArr.length - 1] ?? 52;
+        const ema50 = ema50Arr[ema50Arr.length - 1] ?? livePrice;
+        const rsi14 = rsiArr[rsiArr.length - 1] ?? 50;
         const rsiPrev = rsiArr[rsiArr.length - 2] ?? 50;
         const atr = atrArr[atrArr.length - 1] ?? livePrice * 0.01;
         const atrPct = (atr / Math.max(0.01, livePrice)) * 100;
@@ -1082,14 +1435,13 @@ async function runAiDynamicScanner(timeframe: Timeframe = '1h', useGeminiAi = fa
         const bar6Ago = bars[Math.max(0, bars.length - 7)]?.close || livePrice;
         const momentum6BarsPct = ((livePrice - bar6Ago) / bar6Ago) * 100;
 
-        // Calculate AI Swing Readiness Score (0-100)
         let score = 62;
         const isBullishTrend = livePrice >= ema50 * 0.994 && ema20 >= ema20Prev * 0.999;
         if (isBullishTrend) score += 14;
         if (rsi14 >= 38 && rsi14 <= 64 && rsi14 >= rsiPrev) score += 12;
         if (momentum6BarsPct > 0.25 && momentum6BarsPct < 3.5) score += 8;
         if (atrPct >= 0.45 && atrPct <= 2.4) score += 5;
-        if (rsi14 > 73) score -= 14; // Overextended
+        if (rsi14 > 73) score -= 14;
         score = Math.max(45, Math.min(97, Math.round(score)));
 
         const stopLossPct = parseFloat(Math.max(0.85, Math.min(1.45, atrPct * 1.15 || 1.1)).toFixed(2));
@@ -1101,18 +1453,20 @@ async function runAiDynamicScanner(timeframe: Timeframe = '1h', useGeminiAi = fa
         let setupLabel = 'Pullback su EMA 20 in formazione';
         if (score >= 80) {
           signalStatus = 'BUY_READY';
-          setupLabel = rsi14 < 50
-            ? `Ripartenza da Pullback RSI (${rsi14.toFixed(1)}) + Trend EMA20`
-            : `Breakout Swing ${timeframe} con Momentum (+${momentum6BarsPct.toFixed(2)}%)`;
+          setupLabel =
+            rsi14 < 50
+              ? `Ripartenza da Pullback RSI (${rsi14.toFixed(1)}) + Trend EMA20`
+              : `Breakout Swing ${timeframe} con Momentum (+${momentum6BarsPct.toFixed(2)}%)`;
         } else if (score < 64) {
           signalStatus = 'HOLD_WAIT';
-          setupLabel = rsi14 > 70 ? 'Ipercomprato di breve: attendere ritracciamento' : 'Consolidamento laterale';
+          setupLabel =
+            rsi14 > 70 ? 'Ipercomprato di breve: attendere ritracciamento' : 'Consolidamento laterale';
         }
 
         const rationale =
           signalStatus === 'BUY_READY'
-            ? `Setup ad alta reattività su ${timeframe}: prezzo verificato ${currencySymbol}${livePrice.toFixed(2)} sopra supporto dinamico EMA20 (${currencySymbol}${ema20.toFixed(2)}), RSI a ${rsi14.toFixed(1)}. Target +${takeProfitPct}% (${currencySymbol}${takeProfitPrice}) con Break-Even automatico a +0.8%.`
-            : `Prezzo ${currencySymbol}${livePrice.toFixed(2)} (RSI ${rsi14.toFixed(1)}). Monitoraggio attivo su ${timeframe} per ingresso con rischio controllato (-${stopLossPct}%).`;
+            ? `Setup su ${timeframe}: prezzo reale verificato ${currencySymbol}${livePrice.toFixed(2)} sopra EMA20 (${currencySymbol}${ema20.toFixed(2)}), RSI ${rsi14.toFixed(1)}. Target +${takeProfitPct}% (${currencySymbol}${takeProfitPrice}), Stop -${stopLossPct}%.`
+            : `Prezzo reale ${currencySymbol}${livePrice.toFixed(2)} (RSI ${rsi14.toFixed(1)}). Monitoraggio attivo su ${timeframe} con rischio controllato (-${stopLossPct}%).`;
 
         opportunities.push({
           ticker,
@@ -1126,7 +1480,9 @@ async function runAiDynamicScanner(timeframe: Timeframe = '1h', useGeminiAi = fa
           currency,
           currencySymbol,
           fxRateToEur,
-          isLiveVerified,
+          fxVerified,
+          isLiveVerified: true,
+          dataStatus: 'REALTIME' as DataStatus,
           rsi14: parseFloat(rsi14.toFixed(1)),
           ema20: parseFloat(ema20.toFixed(2)),
           ema50: parseFloat(ema50.toFixed(2)),
@@ -1159,7 +1515,7 @@ async function runAiDynamicScanner(timeframe: Timeframe = '1h', useGeminiAi = fa
   opportunities.sort((a, b) => b.score - a.score);
 
   let aiMarketSummary =
-    'Rotazione Dinamica AI calibrata su timeframe 1h–4h: priorità ai titoli con trend rialzista EMA20/50 e RSI tra 40 e 64 per catturare swing rapidi (+1.8% / +2.5%) proteggendo il capitale con Break-Even automatico a +0.8%.';
+    'Scanner quantitativo su candele storiche reali e chiuse (1h–4h): priorità ai titoli con trend EMA20/50 positivo e RSI controllato, con gestione rigorosa di Stop Loss e cambio valutario live.';
 
   if (useGeminiAi && process.env.GEMINI_API_KEY && opportunities.length > 0) {
     try {
@@ -1179,11 +1535,11 @@ async function runAiDynamicScanner(timeframe: Timeframe = '1h', useGeminiAi = fa
       }));
 
       const resp = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Sei un Quantitative Swing Trader istituzionale. Analizza questi 6 migliori titoli scansionati in tempo reale su timeframe ${timeframe} per generare utili mensili costanti (+2% / +4% mensile) con basso rischio:
+        model: 'gemini-2.5-flash',
+        contents: `Sei un Quantitative Swing Trader istituzionale. Analizza questi 6 titoli scansionati su dati reali di mercato su timeframe ${timeframe}:
 ${JSON.stringify(top6)}
 Fornisci in JSON:
-1) "summary": una sintesi operativa chiara (max 2 frasi in italiano) sul posizionamento ottimale di oggi.
+1) "summary": una sintesi operativa chiara (max 2 frasi in italiano) basata esclusivamente sui numeri reali forniti.
 2) "insights": array di oggetti { "ticker": string, "comment": string } con 1 frase tattica per ciascuno dei 6 titoli.`,
         config: {
           responseMimeType: 'application/json',
@@ -1227,7 +1583,10 @@ Fornisci in JSON:
 
   return {
     timeframe,
-    eurUsdRate: parseFloat(eurUsdRate.toFixed(4)),
+    eurUsdRate: fx.rate,
+    fxVerified: fx.isVerified,
+    fxStatus: fx.status,
+    fxWarning: fx.warning,
     updatedAt: new Date().toISOString(),
     aiMarketSummary,
     topPicks: opportunities.slice(0, 5).map((o) => o.ticker),
@@ -1237,7 +1596,9 @@ Fornisci in JSON:
 
 app.get('/api/ai/scanner', async (req: Request, res: Response) => {
   try {
-    const tf = ((req.query.timeframe as string) || '1h') as Timeframe;
+    const tfCheck = validateTimeframe(req.query.timeframe || '1h');
+    if (!tfCheck.ok) return res.status(400).json({ error: tfCheck.error });
+    const tf = tfCheck.value;
     const useAi = req.query.ai === 'true';
     const cacheKey = `ai_scanner_${tf}_${useAi ? 'ai' : 'quant'}`;
     const cached = cache.get(cacheKey);
@@ -1248,138 +1609,234 @@ app.get('/api/ai/scanner', async (req: Request, res: Response) => {
     cache.set(cacheKey, { timestamp: Date.now(), data: payload });
     res.json(payload);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Errore scanner AI' });
+    res.status(500).json({ error: err?.message || 'Errore scanner AI' });
   }
 });
 
-app.post('/api/ai/scanner', async (req: Request, res: Response) => {
-  try {
-    const tf = ((req.body?.timeframe as string) || '1h') as Timeframe;
-    const useAi = Boolean(req.body?.useAi ?? true);
-    const payload = await runAiDynamicScanner(tf, useAi);
-    cache.set(`ai_scanner_${tf}_quant`, { timestamp: Date.now(), data: payload });
-    res.json(payload);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Errore scanner AI' });
+app.post(
+  '/api/ai/scanner',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const tfCheck = validateTimeframe(req.body?.timeframe || '1h');
+      if (!tfCheck.ok) return res.status(400).json({ error: tfCheck.error });
+      const tf = tfCheck.value;
+      const useAi = Boolean(req.body?.useAi ?? true);
+      const payload = await runAiDynamicScanner(tf, useAi);
+      cache.set(`ai_scanner_${tf}_quant`, { timestamp: Date.now(), data: payload });
+      res.json(payload);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore scanner AI' });
+    }
   }
-});
+);
 
-// Saved Strategy Presets Persistence Routes (Cloud + Disk)
-app.get('/api/saved-strategies', (_req: Request, res: Response) => {
+// -------------------------------------------------------------
+// Saved Strategy Presets Persistence Routes (Owner-Scoped & Authenticated)
+// -------------------------------------------------------------
+app.get('/api/saved-strategies', async (req: Request, res: Response) => {
   try {
-    const presets = serverSavedStrategyService.getAll();
+    const authUser = await resolveRequestAuth(req);
+    const presets = serverSavedStrategyService.getAll(authUser?.uid, authUser?.isAdmin);
     res.json({ presets });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to fetch saved strategies' });
+    res.status(500).json({ error: err?.message || 'Failed to fetch saved strategies' });
   }
 });
 
-app.post('/api/saved-strategies', async (req: Request, res: Response) => {
-  try {
-    const preset = req.body;
-    if (!preset || !preset.id || !preset.name || !preset.strategyId) {
-      return res.status(400).json({ error: 'Preset incompleto' });
+app.post(
+  '/api/saved-strategies',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const preset = req.body;
+      if (!preset || !preset.id || !preset.name || !preset.strategyId) {
+        return res.status(400).json({ error: 'Preset incompleto' });
+      }
+      const idCheck = validateSafeId(preset.id, 'presetId');
+      if (!idCheck.ok) return res.status(400).json({ error: idCheck.error });
+
+      const saved = await serverSavedStrategyService.save(
+        { ...preset, id: idCheck.value },
+        req.authUser?.uid
+      );
+      res.status(201).json({ preset: saved });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to save preset' });
     }
-    const saved = await serverSavedStrategyService.save(preset);
-    res.status(201).json({ preset: saved });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to save preset' });
   }
-});
+);
 
-app.delete('/api/saved-strategies/:id', async (req: Request, res: Response) => {
-  try {
-    const success = await serverSavedStrategyService.delete(req.params.id);
-    res.json({ success });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to delete preset' });
+app.delete(
+  '/api/saved-strategies/:id',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idCheck = validateSafeId(req.params.id, 'presetId');
+      if (!idCheck.ok) return res.status(400).json({ error: idCheck.error });
+
+      const result = await serverSavedStrategyService.delete(
+        idCheck.value,
+        req.authUser?.uid,
+        req.authUser?.isAdmin
+      );
+      if (!result.ok) {
+        const code = result.error?.includes('Permessi') ? 403 : 404;
+        return res.status(code).json({ success: false, error: result.error });
+      }
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Failed to delete preset' });
+    }
   }
-});
+);
 
+// -------------------------------------------------------------
 // Autonomous AI Portfolio Manager & Live Web Briefing Routes
+// -------------------------------------------------------------
 app.get('/api/ai/state', async (req: Request, res: Response) => {
   try {
-    if (req.query.refreshSnapshot === 'true' || aiAutopilotService.getState().marketSnapshot.length === 0) {
+    if (
+      req.query.refreshSnapshot === 'true' ||
+      aiAutopilotService.getState().marketSnapshot.length === 0
+    ) {
       await aiAutopilotService.refreshVerifiedMarketSnapshot();
     }
     res.json(aiAutopilotService.getState());
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Errore stato AI' });
+    res.status(500).json({ error: err?.message || 'Errore stato AI' });
   }
 });
 
-app.post('/api/ai/autopilot/run', async (req: Request, res: Response) => {
-  try {
-    const refreshWeb = req.body?.refreshWeb !== false;
-    const result = await aiAutopilotService.runAutonomousDecisionCycle({
-      trigger: 'USER',
-      refreshWeb,
-    });
-    res.json({
-      ...result,
-      state: aiAutopilotService.getState(),
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Errore durante il ciclo decisionale AI' });
-  }
-});
-
-app.post('/api/ai/autopilot/config', (req: Request, res: Response) => {
-  try {
-    const config = aiAutopilotService.updateConfig(req.body || {});
-    res.json({ config });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message || 'Configurazione non valida' });
-  }
-});
-
-app.post('/api/ai/briefing/refresh', async (_req: Request, res: Response) => {
-  try {
-    const briefing = await aiAutopilotService.refreshWebMarketBriefing();
-    res.json({ briefing, state: aiAutopilotService.getState() });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Errore aggiornamento notizie mercati' });
-  }
-});
-
-app.post('/api/ai/execute-manual-trade', async (req: Request, res: Response) => {
-  try {
-    const { ticker, stopLossPct, takeProfitPct, allocationEur } = req.body || {};
-    if (!ticker) {
-      return res.status(400).json({ error: 'Ticker obbligatorio' });
+app.post(
+  '/api/ai/autopilot/run',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const refreshWeb = req.body?.refreshWeb !== false;
+      const result = await aiAutopilotService.runAutonomousDecisionCycle({
+        trigger: 'USER',
+        refreshWeb,
+      });
+      res.json({
+        ...result,
+        state: aiAutopilotService.getState(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore durante il ciclo decisionale AI' });
     }
-    const cleanTicker = String(ticker).trim().toUpperCase();
-    // Always re-verify the live exchange quote right before executing!
-    const snap =
-      aiAutopilotService.getState().marketSnapshot.find((s) => s.ticker === cleanTicker) ||
-      (await aiAutopilotService.refreshVerifiedMarketSnapshot()).find((s) => s.ticker === cleanTicker);
-
-    if (!snap || !snap.isLiveVerified || snap.price <= 0) {
-      return res.status(503).json({ error: `Quotazione reale non disponibile al momento per ${cleanTicker}. Ordine rifiutato per sicurezza.` });
-    }
-
-    const result = await serverPaperTradingEngine.executeAiOpenPosition({
-      ticker: snap.ticker,
-      name: snap.name,
-      verifiedPrice: snap.price,
-      currency: snap.currency,
-      currencySymbol: snap.currencySymbol,
-      fxRateToEur: snap.fxRateToEur,
-      stopLossPct: Number(stopLossPct) || snap.suggestedStopLossPct,
-      takeProfitPct: Number(takeProfitPct) || snap.suggestedTakeProfitPct,
-      allocationEur: Number(allocationEur) || 1400,
-      reason: `Ordine test manuale su prezzo reale verificato (${snap.currencySymbol}${snap.price}, RSI ${snap.rsi14}, EMA20 ${snap.currencySymbol}${snap.ema20})`,
-      maxPositions: aiAutopilotService.getState().config.maxOpenPositions,
-    });
-
-    if (!result.ok) {
-      return res.status(400).json({ error: result.message });
-    }
-    res.json(result);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Errore esecuzione ordine' });
   }
-});
+);
+
+app.post(
+  '/api/ai/autopilot/config',
+  mutationRateLimiter,
+  requireAuth(),
+  (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const body = req.body || {};
+      if (body.maxOpenPositions !== undefined) {
+        const c = validateFiniteNumber(body.maxOpenPositions, 'maxOpenPositions', 1, 15);
+        if (!c.ok) return res.status(400).json({ error: c.error });
+      }
+      if (body.defaultStopLossPct !== undefined) {
+        const c = validateFiniteNumber(body.defaultStopLossPct, 'defaultStopLossPct', 0.5, 5);
+        if (!c.ok) return res.status(400).json({ error: c.error });
+      }
+      if (body.defaultTakeProfitPct !== undefined) {
+        const c = validateFiniteNumber(body.defaultTakeProfitPct, 'defaultTakeProfitPct', 1, 15);
+        if (!c.ok) return res.status(400).json({ error: c.error });
+      }
+      const config = aiAutopilotService.updateConfig(body);
+      res.json({ config });
+    } catch (err: any) {
+      res.status(400).json({ error: err?.message || 'Configurazione non valida' });
+    }
+  }
+);
+
+app.post(
+  '/api/ai/briefing/refresh',
+  mutationRateLimiter,
+  requireAuth(),
+  async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      const briefing = await aiAutopilotService.refreshWebMarketBriefing();
+      res.json({ briefing, state: aiAutopilotService.getState() });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore aggiornamento notizie mercati' });
+    }
+  }
+);
+
+app.post(
+  '/api/ai/execute-manual-trade',
+  mutationRateLimiter,
+  requireAuth(),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { ticker, stopLossPct, takeProfitPct, allocationEur } = req.body || {};
+      const tickerCheck = validateTicker(ticker);
+      if (!tickerCheck.ok) {
+        return res.status(400).json({ error: tickerCheck.error });
+      }
+      const cleanTicker = tickerCheck.value;
+
+      if (stopLossPct !== undefined) {
+        const c = validateFiniteNumber(stopLossPct, 'stopLossPct', 0.5, 5);
+        if (!c.ok) return res.status(400).json({ error: c.error });
+      }
+      if (takeProfitPct !== undefined) {
+        const c = validateFiniteNumber(takeProfitPct, 'takeProfitPct', 1, 15);
+        if (!c.ok) return res.status(400).json({ error: c.error });
+      }
+      if (allocationEur !== undefined) {
+        const c = validateFiniteNumber(allocationEur, 'allocationEur', 150, 100_000);
+        if (!c.ok) return res.status(400).json({ error: c.error });
+      }
+
+      // Always re-verify the live exchange quote + FX directly on the server before executing!
+      const freshSnapshots = await aiAutopilotService.refreshVerifiedMarketSnapshot();
+      const snap = freshSnapshots.find((s) => s.ticker === cleanTicker);
+
+      if (!snap || !snap.isLiveVerified || snap.price <= 0) {
+        return res.status(503).json({
+          error: `Quotazione reale non disponibile al momento per ${cleanTicker}. Ordine rifiutato per sicurezza.`,
+        });
+      }
+      if (!Number.isFinite(snap.fxRateToEur) || snap.fxRateToEur <= 0) {
+        return res.status(503).json({
+          error: `Cambio reale ${snap.currency}/EUR non verificabile: ordine su ${cleanTicker} rifiutato.`,
+        });
+      }
+
+      const result = await serverPaperTradingEngine.executeAiOpenPosition({
+        ticker: snap.ticker,
+        name: snap.name,
+        verifiedPrice: snap.price,
+        currency: snap.currency,
+        currencySymbol: snap.currencySymbol,
+        fxRateToEur: snap.fxRateToEur,
+        stopLossPct: Number(stopLossPct) || snap.suggestedStopLossPct,
+        takeProfitPct: Number(takeProfitPct) || snap.suggestedTakeProfitPct,
+        allocationEur: Number(allocationEur) || 1400,
+        reason: `Ordine manuale verificato lato server (${snap.currencySymbol}${snap.price}, RSI ${snap.rsi14}, EMA20 ${snap.currencySymbol}${snap.ema20})`,
+        maxPositions: aiAutopilotService.getState().config.maxOpenPositions,
+      });
+
+      if (!result.ok) {
+        return res.status(400).json({ error: result.message });
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Errore esecuzione ordine' });
+    }
+  }
+);
 
 // -------------------------------------------------------------
 // Vite Middleware / Static Server
@@ -1413,18 +1870,16 @@ async function start() {
     });
   }
 
-  // Bind HTTP port 3000 immediately so health probes and preview iframe connect without delay
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`QuantLab Full-Stack Server active on http://0.0.0.0:${PORT}`);
   });
 
-  // Initialize background persistence, 24/7 paper trading engine & autonomous AI autopilot without blocking startup
   serverSavedStrategyService.init().catch((err) => {
     console.warn('[ServerSavedStrategyService] Init warning:', err?.message || err);
   });
 
   serverPaperTradingEngine.init().catch((err) => {
-    console.warn('[PaperTradingServerEngine] Init warning (fallback in-memory):', err?.message || err);
+    console.warn('[PaperTradingServerEngine] Init warning:', err?.message || err);
   });
 
   aiAutopilotService.init().catch((err) => {

@@ -76,8 +76,12 @@ export const LightPortfolioTerminalView: React.FC<LightPortfolioTerminalViewProp
     setClosingId(pos.id);
     setStatusMsg(null);
     try {
-      await globalPaperTradingEngine.manualClosePosition(session.id, pos.id, pos.currentPrice);
-      setStatusMsg(`Posizione su ${pos.symbol} chiusa al prezzo reale verificato.`);
+      const res = await globalPaperTradingEngine.manualClosePosition(session.id, pos.id);
+      if (res.ok) {
+        setStatusMsg(`Posizione su ${pos.symbol} chiusa lato server al prezzo reale verificato.`);
+      } else {
+        setStatusMsg(res.error || `Impossibile chiudere ${pos.symbol}.`);
+      }
     } finally {
       setClosingId(null);
     }

@@ -5,10 +5,9 @@
  * based purely on authentic market exchange prices retrieved via real-time market feeds.
  * Absolutely no synthetic random walks.
  */
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { collection, doc, getDocs, setDoc, deleteDoc, disableNetwork } from 'firebase/firestore';
-import { db } from './firebase';
 import {
   PaperTradingSession,
   Position,
@@ -27,26 +26,59 @@ import { fetchLiveRealBarsSeries, fetchLiveRealQuote } from './realMarketFeed';
 import { isMarketOpenForSymbol } from '../utils/marketHours';
 import { evaluateMacroRegime } from './regimeFilterService';
 import { INSTRUMENTS_DATABASE } from '../data/instruments';
-
-const SESSIONS_COLLECTION = 'paper_sessions';
-const SERVER_STATE_COLLECTION = 'server_state';
+import { atomicWriteJsonFile, readValidatedJsonFile } from './apiSecurity';
+import { validateAndCleanBars } from './marketDataIntegrity';
+import {
+  applyExecutionFriction,
+  computeCommission,
+  evaluateIntrabarExit,
+  updateTrailingStopAfterBar,
+} from './executionMath';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const SERVER_STATE_FILE = path.join(DATA_DIR, 'server_state.json');
 const DELETED_SESSIONS_FILE = path.join(DATA_DIR, 'deleted_session_ids.json');
+const WORKER_LEASE_FILE = path.join(DATA_DIR, 'worker_lease.json');
 const CLEAN_RESET_V4_FILE = path.join(DATA_DIR, 'clean_reset_v5.json');
 
-function resolveAssetCurrencyInfo(ticker: string, fallbackCurrency?: string, quoteFx?: number) {
+interface WorkerLeaseRecord {
+  instanceId: string;
+  pid: number;
+  acquiredAt: number;
+  expiresAt: number;
+}
+
+function resolveAssetCurrencyInfo(
+  ticker: string,
+  fallbackCurrency?: string,
+  quoteFx?: number | null
+): { currency: string; currencySymbol: string; fxRateToEur: number | null; fxVerified: boolean } {
   const t = (ticker || '').trim().toUpperCase();
-  const isEurTicker = t.endsWith('.MI') || t.endsWith('.DE') || t.endsWith('.PA') || t.endsWith('.AS') || t === 'FDAX' || t === 'FIB' || t === 'FGBL' || t === 'PORTFOLIO';
+  const isEurTicker =
+    t.endsWith('.MI') ||
+    t.endsWith('.DE') ||
+    t.endsWith('.PA') ||
+    t.endsWith('.AS') ||
+    t === 'FDAX' ||
+    t === 'FIB' ||
+    t === 'FGBL' ||
+    t === 'PORTFOLIO';
   const catalogInst = INSTRUMENTS_DATABASE.find((i) => i.ticker.toUpperCase() === t);
   const currency = isEurTicker
     ? 'EUR'
     : (catalogInst?.currency || fallbackCurrency || 'USD').toUpperCase();
   const currencySymbol = currency === 'USD' ? '$' : currency === 'GBP' ? '£' : '€';
-  const fxRateToEur = currency === 'EUR' ? 1.0 : (quoteFx && quoteFx > 0 ? quoteFx : 0.92);
-  return { currency, currencySymbol, fxRateToEur };
+  if (currency === 'EUR') {
+    return { currency, currencySymbol, fxRateToEur: 1.0, fxVerified: true };
+  }
+  const hasValidFx = typeof quoteFx === 'number' && Number.isFinite(quoteFx) && quoteFx > 0;
+  return {
+    currency,
+    currencySymbol,
+    fxRateToEur: hasValidFx ? quoteFx! : null,
+    fxVerified: hasValidFx,
+  };
 }
 
 /**
@@ -197,20 +229,17 @@ class ServerPaperTradingEngine {
   private sessions: Map<string, PaperTradingSession> = new Map();
   private deletedSessionIds: Set<string> = new Set();
   private isInitialized = false;
+  private isTickInProgress = false;
   private workerInterval: NodeJS.Timeout | null = null;
+  private readonly workerInstanceId = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
   private lastHeartbeat = Date.now();
   private tickCount = 0;
-  private lastFirestoreSaveTimestamp: Map<string, number> = new Map();
-  private lastHeartbeatFirestoreSave = 0;
-  private isFirestoreQuotaExhausted = false;
-  private quotaCooldownUntil = 0;
 
   public async init(): Promise<void> {
     if (this.isInitialized) return;
     this.isInitialized = true;
-    console.log('[PaperTradingServerEngine] Inizializzazione motore cloud 24/7 con FEED REALE DI MERCATO...');
+    console.log(`[PaperTradingServerEngine] Inizializzazione motore (${this.workerInstanceId}) con FEED REALE DI MERCATO...`);
 
-    // 1. Ensure local data directory exists
     try {
       if (!fs.existsSync(DATA_DIR)) {
         fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -219,81 +248,27 @@ class ServerPaperTradingEngine {
       console.warn('[PaperTradingServerEngine] Creazione cartella dati locale:', e);
     }
 
-    // 1B. Load deleted session IDs (tombstones) to prevent resurrection of deleted sessions
-    try {
-      if (fs.existsSync(DELETED_SESSIONS_FILE)) {
-        const rawDel = fs.readFileSync(DELETED_SESSIONS_FILE, 'utf-8');
-        const parsedDel = JSON.parse(rawDel);
-        if (Array.isArray(parsedDel)) {
-          parsedDel.forEach((id: string) => {
-            if (typeof id === 'string') this.deletedSessionIds.add(id);
-          });
-          console.log(`[PaperTradingServerEngine] Caricati ${this.deletedSessionIds.size} ID sessioni eliminate.`);
-        }
+    const loadedDeleted = readValidatedJsonFile<string[]>(
+      DELETED_SESSIONS_FILE,
+      (v): v is string[] => Array.isArray(v)
+    );
+    if (loadedDeleted) {
+      for (const id of loadedDeleted) {
+        if (typeof id === 'string') this.deletedSessionIds.add(id);
       }
-    } catch (e) {
-      console.warn('[PaperTradingServerEngine] Errore lettura deleted_session_ids:', e);
     }
 
-    // 2. Load from local persistent storage first
-    let loadedFromDisk = false;
-    try {
-      if (fs.existsSync(SESSIONS_FILE)) {
-        const raw = fs.readFileSync(SESSIONS_FILE, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          parsed.forEach((session: PaperTradingSession) => {
-            if (session && session.id && !this.deletedSessionIds.has(session.id)) {
-              this.sessions.set(session.id, session);
-            }
-          });
-          console.log(`[PaperTradingServerEngine] Caricate ${this.sessions.size} sessioni da storage persistente locale.`);
-          loadedFromDisk = true;
+    const loadedSessions = readValidatedJsonFile<PaperTradingSession[]>(
+      SESSIONS_FILE,
+      (v): v is PaperTradingSession[] => Array.isArray(v)
+    );
+    if (loadedSessions) {
+      for (const session of loadedSessions) {
+        if (session && typeof session.id === 'string' && !this.deletedSessionIds.has(session.id)) {
+          this.sessions.set(session.id, session);
         }
       }
-    } catch (e) {
-      console.warn('[PaperTradingServerEngine] Errore lettura storage locale:', e);
-    }
-
-    // 3. Always sync & merge with Firestore (Cloud Database)
-    try {
-      const fetchPromise = getDocs(collection(db, SESSIONS_COLLECTION));
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Firestore init timeout (4000ms)')), 4000)
-      );
-
-      const snapshot: any = await Promise.race([fetchPromise, timeoutPromise]);
-      if (snapshot && typeof snapshot.forEach === 'function') {
-        let newDocsCount = 0;
-        snapshot.forEach((docSnap: any) => {
-          const data = docSnap.data() as PaperTradingSession;
-          if (data && data.id) {
-            // Check tombstone: if session was previously deleted, do not resurrect! Clean it up from Firestore
-            if (this.deletedSessionIds.has(data.id)) {
-              deleteDoc(doc(db, SESSIONS_COLLECTION, data.id)).catch(() => {});
-              return;
-            }
-            const existing = this.sessions.get(data.id);
-            if (!existing) {
-              this.sessions.set(data.id, data);
-              newDocsCount++;
-            } else {
-              // Merge local disk and Firestore states seamlessly without losing any closed trades or history
-              const merged = mergeSessions(existing, data);
-              this.sessions.set(data.id, merged);
-            }
-          }
-        });
-        console.log(`[PaperTradingServerEngine] Sincronizzazione Firestore completata. ${newDocsCount} sessioni caricate dal cloud. Totale: ${this.sessions.size}`);
-        this.saveToLocalDisk();
-      }
-    } catch (err: any) {
-      const errMsg = err?.message || String(err);
-      if (err?.code === 'resource-exhausted' || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('Quota limit exceeded')) {
-        this.handleQuotaExhausted();
-      } else {
-        console.warn('[PaperTradingServerEngine] Avvio in memoria locale resiliente (Firestore bypass):', errMsg);
-      }
+      console.log(`[PaperTradingServerEngine] Caricate ${this.sessions.size} sessioni da storage persistente atomico.`);
     }
 
     // 3B. Sanitize any invalid weekend positions opened when markets were closed
@@ -340,65 +315,77 @@ class ServerPaperTradingEngine {
         const dup = portfolioSessions[i];
         this.sessions.delete(dup.id);
         this.deletedSessionIds.add(dup.id);
-        deleteDoc(doc(db, SESSIONS_COLLECTION, dup.id)).catch(() => {});
       }
       this.saveDeletedSessionIds();
     }
 
-    // 3C. Automatic Clean Reset V4 (wipes corrupted legacy sessions with drifted prices & initializes AI Swing 1h-4h Portfolio)
+    // 3C. Automatic Clean Reset V5 bootstrap if no state file exists yet
     try {
       if (!fs.existsSync(CLEAN_RESET_V4_FILE)) {
-        console.log('[PaperTradingServerEngine] Esecuzione Reset Pulito V4: rimozione sessioni legacy corrotte e avvio Portafoglio AI Swing 1h-4h con prezzi reali verificati...');
         await this.resetCleanAndStartAiSwingPortfolio({
           tickers: ['NVDA', 'AAPL', 'MSFT', 'UCG.MI', 'ENEL.MI'],
           initialCapital: 10000,
           timeframe: '1h',
         });
-        fs.writeFileSync(
-          CLEAN_RESET_V4_FILE,
-          JSON.stringify({ resetAt: new Date().toISOString(), version: 'v4_verified_prices_ai_swing' }, null, 2),
-          'utf-8'
-        );
+        atomicWriteJsonFile(CLEAN_RESET_V4_FILE, {
+          resetAt: new Date().toISOString(),
+          version: 'v5_verified_prices_ai_swing',
+        });
       }
     } catch (e) {
-      console.warn('[PaperTradingServerEngine] Avviso Reset Pulito V4:', e);
+      console.warn('[PaperTradingServerEngine] Avviso Reset Pulito:', e);
     }
 
     this.saveToLocalDisk();
-
-    // 4. Start background real-market polling loop (every 15 seconds)
     this.startWorker();
-  }
-
-  private handleQuotaExhausted() {
-    this.isFirestoreQuotaExhausted = true;
-    this.quotaCooldownUntil = Date.now() + 60 * 60 * 1000; // 1 hour cooldown
-    console.log('[PaperTradingServerEngine] Quota Firestore Spark Free Tier raggiunta: rete Firestore disattivata per eliminare stream gRPC.');
-    try {
-      disableNetwork(db).catch(() => {});
-    } catch (_) {}
   }
 
   private saveToLocalDisk() {
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
       const data = Array.from(this.sessions.values()).filter((s) => !this.deletedSessionIds.has(s.id));
-      fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+      atomicWriteJsonFile(SESSIONS_FILE, data);
     } catch (e) {
-      console.warn('[PaperTradingServerEngine] Errore scrittura storage locale:', e);
+      console.warn('[PaperTradingServerEngine] Errore scrittura atomica storage locale:', e);
     }
   }
 
   private saveDeletedSessionIds() {
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      fs.writeFileSync(DELETED_SESSIONS_FILE, JSON.stringify(Array.from(this.deletedSessionIds), null, 2), 'utf-8');
+      atomicWriteJsonFile(DELETED_SESSIONS_FILE, Array.from(this.deletedSessionIds));
     } catch (e) {
-      console.warn('[PaperTradingServerEngine] Errore scrittura deleted_session_ids:', e);
+      console.warn('[PaperTradingServerEngine] Errore scrittura atomica deleted_session_ids:', e);
+    }
+  }
+
+  /**
+   * Acquires or renews a short-lived worker lease file so overlapping workers / duplicate
+   * instances never execute double trades concurrently.
+   */
+  private acquireWorkerLease(ttlMs = 25_000): boolean {
+    const now = Date.now();
+    const existing = readValidatedJsonFile<WorkerLeaseRecord>(
+      WORKER_LEASE_FILE,
+      (v): v is WorkerLeaseRecord =>
+        typeof v === 'object' &&
+        v !== null &&
+        typeof (v as any).instanceId === 'string' &&
+        typeof (v as any).expiresAt === 'number'
+    );
+
+    if (existing && existing.instanceId !== this.workerInstanceId && existing.expiresAt > now) {
+      return false;
+    }
+
+    try {
+      atomicWriteJsonFile(WORKER_LEASE_FILE, {
+        instanceId: this.workerInstanceId,
+        pid: process.pid,
+        acquiredAt: now,
+        expiresAt: now + ttlMs,
+      });
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -407,33 +394,40 @@ class ServerPaperTradingEngine {
 
     this.workerInterval = setInterval(async () => {
       await this.runBackgroundTick();
-    }, 15000); // 15s polling interval to fetch real live exchange data
+    }, 15000);
 
-    console.log('[PaperTradingServerEngine] Background Worker H24 (Dati Reali di Borsa) avviato con successo.');
+    console.log(`[PaperTradingServerEngine] Background Worker (${this.workerInstanceId}) avviato con lease guard.`);
   }
 
-  /**
-   * Main background evaluation tick executing on real live market data
-   */
   private async runBackgroundTick() {
-    this.lastHeartbeat = Date.now();
-    this.tickCount++;
-
-    const activeSessions = Array.from(this.sessions.values()).filter((s) => s.isActive && !s.isPaused);
-    if (activeSessions.length === 0) {
-      this.updateServerHeartbeat(0);
+    if (this.isTickInProgress) return;
+    if (!this.acquireWorkerLease(25_000)) {
       return;
     }
 
-    for (const session of activeSessions) {
-      try {
-        await this.processSessionRealMarketTick(session);
-      } catch (e) {
-        console.error(`[PaperTradingServerEngine] Errore elaborazione tick per sessione ${session.id}:`, e);
-      }
-    }
+    this.isTickInProgress = true;
+    try {
+      this.lastHeartbeat = Date.now();
+      this.tickCount++;
 
-    this.updateServerHeartbeat(activeSessions.length);
+      const activeSessions = Array.from(this.sessions.values()).filter((s) => s.isActive && !s.isPaused);
+      if (activeSessions.length === 0) {
+        this.updateServerHeartbeat(0);
+        return;
+      }
+
+      for (const session of activeSessions) {
+        try {
+          await this.processSessionRealMarketTick(session);
+        } catch (e) {
+          console.error(`[PaperTradingServerEngine] Errore elaborazione tick per sessione ${session.id}:`, e);
+        }
+      }
+
+      this.updateServerHeartbeat(activeSessions.length);
+    } finally {
+      this.isTickInProgress = false;
+    }
   }
 
   /**
@@ -463,11 +457,16 @@ class ServerPaperTradingEngine {
     const currentPrice = realQuote?.price || latestBar?.close || session.instrument.currentPrice;
     if (!currentPrice || isNaN(currentPrice) || currentPrice <= 0) return;
 
-    const { currency, currencySymbol, fxRateToEur } = resolveAssetCurrencyInfo(
+    const { currency, currencySymbol, fxRateToEur, fxVerified } = resolveAssetCurrencyInfo(
       symbol,
       realQuote?.currency || session.instrument.currency,
       realQuote?.fxRateToEur
     );
+
+    if (!fxVerified || fxRateToEur === null) {
+      session.marketStatusNotice = `Cambio reale ${currency}/EUR non disponibile: valutazione EUR sospesa per integrità dati.`;
+      return;
+    }
 
     // Update instrument real price & native currency
     session.instrument.currentPrice = currentPrice;
@@ -492,107 +491,69 @@ class ServerPaperTradingEngine {
     const strategy = getStrategyById(session.strategyId) || getStrategyById('ai_dynamic_swing_1h');
     if (!strategy) return;
 
-    // 2. Monitor open positions against REAL market prices (SL / TP / Break-Even +0.8% / Trailing Stop)
+    // 2. Monitor open positions using SHARED executionMath (zero look-ahead: evaluate prior stop BEFORE updating trailing stop!)
     const remainingPositions: Position[] = [];
+    const execCosts = { slippagePct: session.slippagePct, spreadPct: 0.02 };
+    const tickBar: Bar = {
+      timestamp: now,
+      dateStr,
+      open: currentPrice,
+      high: Math.max(activeBar.high, currentPrice),
+      low: Math.min(activeBar.low, currentPrice),
+      close: currentPrice,
+      volume: activeBar.volume,
+    };
 
     for (const pos of session.openPositions || []) {
       pos.currentPrice = currentPrice;
       pos.durationMinutes = Math.max(1, Math.round((now - pos.entryTimestamp) / (60 * 1000)));
 
-      if (activeBar.high > pos.highestPriceSinceEntry) pos.highestPriceSinceEntry = activeBar.high;
-      if (activeBar.low < pos.lowestPriceSinceEntry) pos.lowestPriceSinceEntry = activeBar.low;
-      if (currentPrice > pos.highestPriceSinceEntry) pos.highestPriceSinceEntry = currentPrice;
-      if (currentPrice < pos.lowestPriceSinceEntry) pos.lowestPriceSinceEntry = currentPrice;
+      const exitEval = evaluateIntrabarExit(pos, tickBar, execCosts);
 
-      // Automatic Break-Even & Profit Lock when unrealized gain >= +0.8%
-      const peakGainPct = pos.direction === 'LONG'
-        ? ((pos.highestPriceSinceEntry - pos.entryPrice) / pos.entryPrice) * 100
-        : ((pos.entryPrice - pos.lowestPriceSinceEntry) / pos.entryPrice) * 100;
-
-      if (peakGainPct >= 0.8) {
-        if (pos.direction === 'LONG') {
-          const breakEvenPlus = parseFloat((pos.entryPrice * 1.0015).toFixed(4));
-          if (pos.stopLoss < breakEvenPlus) {
-            pos.stopLoss = breakEvenPlus;
-          }
-          const lockedTrail = parseFloat((pos.highestPriceSinceEntry * 0.994).toFixed(4));
-          if (!pos.trailingStop || lockedTrail > pos.trailingStop) {
-            pos.trailingStop = lockedTrail;
-          }
-        } else {
-          const breakEvenShort = parseFloat((pos.entryPrice * 0.9985).toFixed(4));
-          if (pos.stopLoss > breakEvenShort) {
-            pos.stopLoss = breakEvenShort;
-          }
-          const lockedTrail = parseFloat((pos.lowestPriceSinceEntry * 1.006).toFixed(4));
-          if (!pos.trailingStop || lockedTrail < pos.trailingStop) {
-            pos.trailingStop = lockedTrail;
-          }
-        }
-      }
-
-      // Custom Trailing stop parameter update
-      if (session.params.trailingStopPct && Number(session.params.trailingStopPct) > 0) {
-        const trailPct = Number(session.params.trailingStopPct);
-        if (pos.direction === 'LONG') {
-          const trailPrice = pos.highestPriceSinceEntry * (1 - trailPct / 100);
-          if (!pos.trailingStop || trailPrice > pos.trailingStop) {
-            pos.trailingStop = parseFloat(trailPrice.toFixed(4));
-          }
-        } else {
-          const trailPrice = pos.lowestPriceSinceEntry * (1 + trailPct / 100);
-          if (!pos.trailingStop || trailPrice < pos.trailingStop) {
-            pos.trailingStop = parseFloat(trailPrice.toFixed(4));
-          }
-        }
-      }
-
-      const activeStop = pos.trailingStop
-        ? (pos.direction === 'LONG'
-            ? (pos.trailingStop > pos.stopLoss ? pos.trailingStop : pos.stopLoss)
-            : (pos.trailingStop < pos.stopLoss ? pos.trailingStop : pos.stopLoss))
-        : pos.stopLoss;
-      let exitPrice: number | null = null;
-      let exitReason: Trade['exitReason'] = 'MANUAL';
-
-      if (pos.direction === 'LONG') {
-        if (activeBar.low <= activeStop || currentPrice <= activeStop) {
-          exitPrice = activeStop * (1 - session.slippagePct / 100);
-          exitReason = activeStop === pos.trailingStop ? 'TRAILING_STOP' : 'STOP_LOSS';
-        } else if (activeBar.high >= pos.takeProfit || currentPrice >= pos.takeProfit) {
-          exitPrice = pos.takeProfit * (1 - session.slippagePct / 100);
-          exitReason = 'TAKE_PROFIT';
-        }
-      } else if (pos.direction === 'SHORT') {
-        if (activeBar.high >= activeStop || currentPrice >= activeStop) {
-          exitPrice = activeStop * (1 + session.slippagePct / 100);
-          exitReason = activeStop === pos.trailingStop ? 'TRAILING_STOP' : 'STOP_LOSS';
-        } else if (activeBar.low <= pos.takeProfit || currentPrice <= pos.takeProfit) {
-          exitPrice = pos.takeProfit * (1 + session.slippagePct / 100);
-          exitReason = 'TAKE_PROFIT';
-        }
-      }
-
-      if (exitPrice !== null) {
-        this.closePositionInternal(session, pos, exitPrice, now, dateStr, exitReason, undefined, fxRateToEur, currencySymbol);
+      if (exitEval.exited && exitEval.exitReason) {
+        this.closePositionInternal(
+          session,
+          pos,
+          exitEval.exitPrice,
+          now,
+          dateStr,
+          exitEval.exitReason,
+          exitEval.collisionNote,
+          fxRateToEur,
+          currencySymbol
+        );
       } else {
-        const grossPnlNative = pos.direction === 'LONG'
-          ? (pos.currentPrice - pos.entryPrice) * pos.quantity
-          : (pos.entryPrice - pos.currentPrice) * pos.quantity;
+        // Strictly AFTER exit check, update break-even / trailing stop for next tick
+        updateTrailingStopAfterBar(
+          pos,
+          tickBar,
+          Number(session.params.trailingStopPct || 0),
+          { enableBreakEvenAtPct: 0.8, breakEvenLockTrailPct: 0.6 }
+        );
+        const grossPnlNative =
+          pos.direction === 'LONG'
+            ? (pos.currentPrice - pos.entryPrice) * pos.quantity
+            : (pos.entryPrice - pos.currentPrice) * pos.quantity;
         const grossPnlEur = grossPnlNative * fxRateToEur;
         pos.unrealizedPnlAmount = parseFloat(grossPnlEur.toFixed(2));
-        pos.unrealizedPnlPercent = parseFloat((((pos.currentPrice - pos.entryPrice) / pos.entryPrice) * 100 * (pos.direction === 'LONG' ? 1 : -1)).toFixed(2));
+        pos.unrealizedPnlPercent = parseFloat(
+          (((pos.currentPrice - pos.entryPrice) / pos.entryPrice) * 100 * (pos.direction === 'LONG' ? 1 : -1)).toFixed(2)
+        );
         remainingPositions.push(pos);
       }
     }
 
     session.openPositions = remainingPositions;
 
-    // 3. Evaluate Strategy rules on the FULL authentic real market bar series
-    if (realBars && realBars.length >= 2) {
-      const barIndex = realBars.length - 1;
+    // 3. Evaluate Strategy rules strictly on CLOSED verified bars (exclude still-forming intraday bar)
+    const { bars: closedRealBars } = validateAndCleanBars(realBars || [], session.timeframe, {
+      excludeIncompleteLastBar: true,
+      nowMs: now,
+    });
+    if (closedRealBars.length >= 2) {
+      const barIndex = closedRealBars.length - 1;
       const currentPosDir = session.openPositions.length > 0 ? session.openPositions[0].direction : 'NONE';
-      const signal = strategy.evaluate(realBars, barIndex, session.params, currentPosDir);
+      const signal = strategy.evaluate(closedRealBars, barIndex, session.params, currentPosDir);
 
       // 4. Exit signals triggered by strategy rules (only if position exists)
       const hasOpenPos = session.openPositions.length > 0;
@@ -626,8 +587,8 @@ class ServerPaperTradingEngine {
           return;
         }
 
-        // Prevent re-evaluating and entering on the exact same bar
-        const lastBar = realBars[barIndex];
+        // Prevent re-evaluating and entering on the exact same closed bar
+        const lastBar = closedRealBars[barIndex];
         if (session.lastEvaluatedBarTimestamp && lastBar && lastBar.timestamp <= session.lastEvaluatedBarTimestamp) {
           return;
         }
@@ -751,11 +712,19 @@ class ServerPaperTradingEngine {
         continue;
       }
       const currentPrice = quote.price;
-      const { currency, currencySymbol, fxRateToEur } = resolveAssetCurrencyInfo(
+      const { currency, currencySymbol, fxRateToEur, fxVerified } = resolveAssetCurrencyInfo(
         ticker,
         quote.currency || constituent.instrument.currency,
         quote.fxRateToEur
       );
+      if (!fxVerified || fxRateToEur === null) {
+        // Never convert USD/GBP to EUR without verified live FX
+        for (const pos of constituent.openPositions || []) {
+          allOpenPositions.push(pos);
+          totalUnrealizedPnl += pos.unrealizedPnlAmount || 0;
+        }
+        continue;
+      }
 
       constituent.lastPrice = currentPrice;
       constituent.instrument.currentPrice = currentPrice;
@@ -776,71 +745,38 @@ class ServerPaperTradingEngine {
 
         pos.currentPrice = effectivePrice;
         pos.durationMinutes = Math.max(1, Math.round((now - pos.entryTimestamp) / (60 * 1000)));
-
-        if (effectivePrice > pos.highestPriceSinceEntry) pos.highestPriceSinceEntry = effectivePrice;
-        if (effectivePrice < pos.lowestPriceSinceEntry) pos.lowestPriceSinceEntry = effectivePrice;
-
         const isLong = pos.direction === 'LONG';
-        const peakGainPct = isLong
-          ? ((pos.highestPriceSinceEntry - pos.entryPrice) / pos.entryPrice) * 100
-          : ((pos.entryPrice - pos.lowestPriceSinceEntry) / pos.entryPrice) * 100;
+        const spotBar: Bar = {
+          timestamp: now,
+          dateStr,
+          open: effectivePrice,
+          high: effectivePrice,
+          low: effectivePrice,
+          close: effectivePrice,
+          volume: 0,
+        };
+        const exitEval = evaluateIntrabarExit(pos, spotBar, {
+          slippagePct: session.slippagePct,
+          spreadPct: 0.02,
+        });
+        const hitExit = exitEval.exited && exitEval.exitReason !== null;
+        const exitPrice = hitExit ? exitEval.exitPrice : effectivePrice;
+        const exitReason: Trade['exitReason'] = exitEval.exitReason || 'MANUAL';
 
-        // Automatic Break-Even & Profit Lock at +0.8% gain
-        if (peakGainPct >= 0.8) {
-          if (isLong) {
-            const breakEvenPlus = parseFloat((pos.entryPrice * 1.0015).toFixed(4));
-            if (pos.stopLoss < breakEvenPlus) {
-              pos.stopLoss = breakEvenPlus;
-            }
-            const lockedTrail = parseFloat((pos.highestPriceSinceEntry * 0.994).toFixed(4));
-            if (!pos.trailingStop || lockedTrail > pos.trailingStop) {
-              pos.trailingStop = lockedTrail;
-            }
-          } else {
-            const breakEvenShort = parseFloat((pos.entryPrice * 0.9985).toFixed(4));
-            if (pos.stopLoss > breakEvenShort) {
-              pos.stopLoss = breakEvenShort;
-            }
-            const lockedTrail = parseFloat((pos.lowestPriceSinceEntry * 1.006).toFixed(4));
-            if (!pos.trailingStop || lockedTrail < pos.trailingStop) {
-              pos.trailingStop = lockedTrail;
-            }
-          }
-        }
-
-        const activeStop = pos.trailingStop
-          ? (isLong ? Math.max(pos.stopLoss, pos.trailingStop) : Math.min(pos.stopLoss, pos.trailingStop))
-          : pos.stopLoss;
-
-        let hitExit = false;
-        let exitPrice = effectivePrice;
-        let exitReason: Trade['exitReason'] = 'MANUAL';
-
-        if (isLong) {
-          if (effectivePrice <= activeStop) {
-            hitExit = true;
-            exitPrice = activeStop;
-            exitReason = activeStop === pos.trailingStop ? 'TRAILING_STOP' : 'STOP_LOSS';
-          } else if (effectivePrice >= pos.takeProfit) {
-            hitExit = true;
-            exitPrice = pos.takeProfit;
-            exitReason = 'TAKE_PROFIT';
-          }
-        } else {
-          if (effectivePrice >= activeStop) {
-            hitExit = true;
-            exitPrice = activeStop;
-            exitReason = activeStop === pos.trailingStop ? 'TRAILING_STOP' : 'STOP_LOSS';
-          } else if (effectivePrice <= pos.takeProfit) {
-            hitExit = true;
-            exitPrice = pos.takeProfit;
-            exitReason = 'TAKE_PROFIT';
-          }
+        if (!hitExit) {
+          updateTrailingStopAfterBar(
+            pos,
+            spotBar,
+            Number(constituent.params?.trailingStopPct || session.params?.trailingStopPct || 0),
+            { enableBreakEvenAtPct: 0.8, breakEvenLockTrailPct: 0.6 }
+          );
         }
 
         if (hitExit) {
           const grossPnlNative = isLong ? (exitPrice - pos.entryPrice) * pos.quantity : (pos.entryPrice - exitPrice) * pos.quantity;
-          const commNative = (pos.entryPrice * pos.quantity + exitPrice * pos.quantity) * 0.0005;
+          const commNative =
+            computeCommission(pos.entryPrice * pos.quantity, session.commissionPct) +
+            computeCommission(exitPrice * pos.quantity, session.commissionPct);
           const netPnlEur = (grossPnlNative - commNative) * fxRateToEur;
           const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100 * (isLong ? 1 : -1) - 0.1;
 
@@ -907,7 +843,11 @@ class ServerPaperTradingEngine {
           if (strat) {
             try {
               const tf = constituent.timeframe || session.timeframe || '1h';
-              const bars = await fetchLiveRealBarsSeries(ticker, tf);
+              const rawBars = await fetchLiveRealBarsSeries(ticker, tf);
+              const { bars } = validateAndCleanBars(rawBars, tf, {
+                excludeIncompleteLastBar: true,
+                nowMs: now,
+              });
               if (bars && bars.length >= 2) {
                 const lastIdx = bars.length - 1;
                 const lastBar = bars[lastIdx];
@@ -1015,18 +955,23 @@ class ServerPaperTradingEngine {
     fxRateToEurParam?: number,
     currencySymParam?: string
   ) {
-    const { currencySymbol, fxRateToEur } = resolveAssetCurrencyInfo(
+    const { currencySymbol, fxRateToEur, fxVerified } = resolveAssetCurrencyInfo(
       pos.symbol,
       session.instrument.currency,
       fxRateToEurParam
     );
+    if (!fxVerified || fxRateToEur === null) {
+      throw new Error(`Cambio reale non disponibile per chiudere ${pos.symbol} in EUR.`);
+    }
     const sym = currencySymParam || currencySymbol;
 
     const grossPnlNative = pos.direction === 'LONG'
       ? (exitPrice - pos.entryPrice) * pos.quantity
       : (pos.entryPrice - exitPrice) * pos.quantity;
 
-    const commissionNative = (pos.entryPrice * pos.quantity + exitPrice * pos.quantity) * (session.commissionPct / 100);
+    const commissionNative =
+      computeCommission(pos.entryPrice * pos.quantity, session.commissionPct) +
+      computeCommission(exitPrice * pos.quantity, session.commissionPct);
     const netPnlEur = (grossPnlNative - commissionNative) * fxRateToEur;
     const pnlPct = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100 * (pos.direction === 'LONG' ? 1 : -1) - session.commissionPct * 2;
     const durationMinutes = Math.max(1, Math.round((exitTimestamp - pos.entryTimestamp) / (60 * 1000)));
@@ -1123,89 +1068,24 @@ class ServerPaperTradingEngine {
     session.alerts = [alert, ...currentAlerts].slice(0, 50);
   }
 
-  private async saveSessionToFirestore(session: PaperTradingSession, force = false) {
-    // Always persist to local disk immediately
+  private async saveSessionToFirestore(_session: PaperTradingSession, _force = false) {
+    // Authoritative server-side persistence via atomic disk store.
+    // Client-side Firestore writes are strictly gated by verified user auth rules in firestore.rules.
     this.saveToLocalDisk();
-
-    const now = Date.now();
-
-    // If quota is exhausted and cooldown is active, skip remote write completely
-    if (this.isFirestoreQuotaExhausted && now < this.quotaCooldownUntil) {
-      return;
-    }
-
-    // For routine ticks, throttle to at most once every 15 minutes per session
-    if (!force) {
-      const lastSave = this.lastFirestoreSaveTimestamp.get(session.id) || 0;
-      if (now - lastSave < 900_000) {
-        return;
-      }
-    }
-
-    try {
-      const sanitized = sanitizeForFirestore(session);
-      await setDoc(doc(db, SESSIONS_COLLECTION, session.id), sanitized);
-      this.lastFirestoreSaveTimestamp.set(session.id, now);
-      this.isFirestoreQuotaExhausted = false;
-    } catch (e: any) {
-      const errMsg = e?.message || String(e);
-      const isQuota =
-        e?.code === 'resource-exhausted' ||
-        errMsg.includes('RESOURCE_EXHAUSTED') ||
-        errMsg.includes('Quota limit exceeded') ||
-        errMsg.includes('quota metric');
-
-      if (isQuota) {
-        this.handleQuotaExhausted();
-      } else {
-        console.warn(`[PaperTradingServerEngine] Avviso salvataggio Firestore per ${session.id}:`, errMsg);
-      }
-    }
   }
 
   private async updateServerHeartbeat(activeCount: number) {
     const now = Date.now();
-    // Save state locally
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      fs.writeFileSync(
-        SERVER_STATE_FILE,
-        JSON.stringify(
-          {
-            lastHeartbeat: this.lastHeartbeat,
-            activeSessionsCount: activeCount,
-            serverStatus: 'ONLINE_24_7_REAL_FEED',
-            tickCount: this.tickCount,
-            updatedAt: now,
-          },
-          null,
-          2
-        ),
-        'utf-8'
-      );
-    } catch (_) {}
-
-    // Only write heartbeat to Firestore at most once every 30 minutes and only if not quota-limited
-    if (this.isFirestoreQuotaExhausted && now < this.quotaCooldownUntil) return;
-    if (now - this.lastHeartbeatFirestoreSave < 1800_000) return;
-
-    try {
-      await setDoc(doc(db, SERVER_STATE_COLLECTION, 'main'), {
+      atomicWriteJsonFile(SERVER_STATE_FILE, {
         lastHeartbeat: this.lastHeartbeat,
         activeSessionsCount: activeCount,
         serverStatus: 'ONLINE_24_7_REAL_FEED',
         tickCount: this.tickCount,
+        workerInstanceId: this.workerInstanceId,
+        updatedAt: now,
       });
-      this.lastHeartbeatFirestoreSave = now;
-      this.isFirestoreQuotaExhausted = false;
-    } catch (e: any) {
-      const errMsg = e?.message || String(e);
-      if (e?.code === 'resource-exhausted' || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('Quota limit exceeded')) {
-        this.handleQuotaExhausted();
-      }
-    }
+    } catch (_) {}
   }
 
   // --- Public API Methods ---
@@ -1314,7 +1194,6 @@ class ServerPaperTradingEngine {
           if (sId !== existingPortfolio.id && (s.isPortfolio || s.strategyCategory === 'MULTI_STRATEGY' || sId.includes('portfolio'))) {
             this.sessions.delete(sId);
             this.deletedSessionIds.add(sId);
-            deleteDoc(doc(db, SESSIONS_COLLECTION, sId)).catch(() => {});
           }
         }
         await this.processPortfolioSessionRealMarketTick(existingPortfolio);
@@ -1439,38 +1318,63 @@ class ServerPaperTradingEngine {
         if (s.isPortfolio || s.strategyCategory === 'MULTI_STRATEGY' || id.includes('portfolio')) {
           this.deletedSessionIds.add(id);
           this.sessions.delete(id);
-          deleteDoc(doc(db, SESSIONS_COLLECTION, id)).catch(() => {});
         }
       }
     }
 
     this.saveDeletedSessionIds();
     this.saveToLocalDisk();
-
-    try {
-      await deleteDoc(doc(db, SESSIONS_COLLECTION, sessionId));
-      return true;
-    } catch (e: any) {
-      const errMsg = e?.message || String(e);
-      if (e?.code === 'resource-exhausted' || errMsg.includes('RESOURCE_EXHAUSTED')) {
-        this.handleQuotaExhausted();
-      } else {
-        console.warn(`[PaperTradingServerEngine] Errore cancellazione Firestore per ${sessionId}:`, errMsg);
-      }
-      return true;
-    }
+    return true;
   }
 
-  public async manualClosePosition(sessionId: string, positionId: string, currentPrice: number): Promise<PaperTradingSession | null> {
+  /**
+   * Authoritative server-side position closure.
+   * SECURITY: NEVER accepts client-supplied prices; always fetches the verified real live quote
+   * and verified FX rate directly on the server before closing and calculating P&L.
+   */
+  public async manualClosePosition(
+    sessionId: string,
+    positionId: string
+  ): Promise<{ ok: boolean; session?: PaperTradingSession; error?: string }> {
     const session = this.sessions.get(sessionId);
-    if (!session) return null;
+    if (!session) return { ok: false, error: 'Sessione non trovata.' };
     const pos = (session.openPositions || []).find((p) => p.id === positionId);
-    if (!pos) return null;
+    if (!pos) return { ok: false, error: 'Posizione aperta non trovata.' };
+
+    const liveQuote = await fetchLiveRealQuote(pos.symbol);
+    if (!liveQuote || !liveQuote.isLiveVerified || liveQuote.price <= 0) {
+      return {
+        ok: false,
+        error: `Quotazione live verificata non disponibile per ${pos.symbol}: chiusura rifiutata per integrità prezzi.`,
+      };
+    }
+    if (!liveQuote.fxVerified || liveQuote.fxRateToEur === null) {
+      return {
+        ok: false,
+        error: `Tasso di cambio reale non disponibile per ${liveQuote.currency}/EUR: chiusura rinviata.`,
+      };
+    }
+
+    const { fillPrice } = applyExecutionFriction(
+      liveQuote.price,
+      pos.direction === 'LONG' ? 'SELL' : 'BUY',
+      { slippagePct: session.slippagePct, spreadPct: 0.02 }
+    );
 
     const now = Date.now();
     const dateStr = new Date(now).toISOString().replace('T', ' ').substring(0, 16);
 
-    this.closePositionInternal(session, pos, currentPrice, now, dateStr, 'MANUAL');
+    this.closePositionInternal(
+      session,
+      pos,
+      fillPrice,
+      now,
+      dateStr,
+      'MANUAL',
+      undefined,
+      liveQuote.fxRateToEur,
+      liveQuote.currencySymbol
+    );
     session.openPositions = (session.openPositions || []).filter((p) => p.id !== positionId);
     if (session.constituents) {
       session.constituents.forEach((c) => {
@@ -1478,8 +1382,7 @@ class ServerPaperTradingEngine {
       });
     }
     this.saveToLocalDisk();
-    await this.saveSessionToFirestore(session, true);
-    return JSON.parse(JSON.stringify(session));
+    return { ok: true, session: JSON.parse(JSON.stringify(session)) };
   }
 
   public async markAlertAsRead(sessionId: string, alertId: string): Promise<void> {
@@ -1612,9 +1515,6 @@ class ServerPaperTradingEngine {
       this.deletedSessionIds.add(id);
       this.sessions.delete(id);
       deletedCount++;
-      try {
-        deleteDoc(doc(db, SESSIONS_COLLECTION, id)).catch(() => {});
-      } catch (_) {}
     }
 
     this.saveDeletedSessionIds();
@@ -1846,12 +1746,24 @@ class ServerPaperTradingEngine {
     const entryPrice = parseFloat(params.verifiedPrice.toFixed(4));
     const stopLoss = parseFloat((entryPrice * (1 - clampedSlPct / 100)).toFixed(4));
     const takeProfit = parseFloat((entryPrice * (1 + clampedTpPct / 100)).toFixed(4));
-    const fx = params.fxRateToEur > 0 ? params.fxRateToEur : params.currency === 'EUR' ? 1.0 : 0.92;
+    const fx =
+      params.currency === 'EUR'
+        ? 1.0
+        : Number.isFinite(params.fxRateToEur) && params.fxRateToEur > 0
+        ? params.fxRateToEur
+        : null;
+    if (fx === null) {
+      return {
+        ok: false,
+        message: `Tasso di cambio reale ${params.currency}/EUR non disponibile: ordine su ${ticker} annullato.`,
+      };
+    }
 
     // Ensure cash availability based on total session capital minus deployed capital
     const deployedEur = currentOpen.reduce((sum, p) => {
-      const c = resolveAssetCurrencyInfo(p.symbol);
-      return sum + p.entryPrice * p.quantity * c.fxRateToEur;
+      const c = resolveAssetCurrencyInfo(p.symbol, undefined, fx);
+      const effectiveFx = c.fxRateToEur ?? fx;
+      return sum + p.entryPrice * p.quantity * effectiveFx;
     }, 0);
     const availableCashEur = Math.max(0, session.currentCapital - deployedEur);
     const targetBudgetEur = Math.min(params.allocationEur, availableCashEur * 0.92, session.currentCapital * 0.25);

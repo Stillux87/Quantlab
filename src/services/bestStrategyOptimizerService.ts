@@ -20,7 +20,7 @@ import {
 import { ALL_STRATEGIES, getStrategyById } from './strategies/registry';
 import { IStrategy } from './strategies/types';
 import { runBacktest, BacktestOptions } from './backtestEngine';
-import { generateHistoricalBars } from './dataFeed';
+import { aggregateHourlyBars } from './marketDataIntegrity';
 import { INSTRUMENTS_DATABASE } from '../data/instruments';
 
 /**
@@ -669,19 +669,29 @@ function generateStrategyExplanation(
  */
 export function runCrossTimeframeMatrix(
   preset: SavedStrategyPreset,
-  instrument: Instrument
+  instrument: Instrument,
+  barsByTimeframe?: Partial<Record<Timeframe, Bar[]>>
 ): TimeframeComparisonRow[] {
   const strategy = getStrategyById(preset.strategyId);
   if (!strategy) return [];
 
-  const timeframes: Timeframe[] = ['15m', '30m', '1h', '4h', '1D'];
+  const timeframes: Timeframe[] = ['15m', '30m', '1h', '2h', '4h', '1D'];
   const rows: TimeframeComparisonRow[] = [];
+
+  const labelMap: Record<Timeframe, string> = {
+    '1m': '1 Minuto',
+    '5m': '5 Minuti',
+    '15m': '15 Minuti (Intraday Veloce)',
+    '30m': '30 Minuti (Intraday Medio)',
+    '1h': '1 Ora (Swing Breve)',
+    '2h': '2 Ore (Swing Medio-Breve)',
+    '4h': '4 Ore (Swing Medio)',
+    '1D': '1 Giorno (Daily Swing)',
+  };
 
   for (const tf of timeframes) {
     const isBaseline = tf === preset.timeframe;
 
-    // When evaluating the baseline timeframe on which the strategy was calibrated,
-    // strictly use the original metrics so results are 100% identical!
     if (isBaseline && preset.originalMetrics) {
       const om = preset.originalMetrics;
       const isProfitable = om.totalReturnPct > 0;
@@ -691,17 +701,6 @@ export function runCrossTimeframeMatrix(
       } else if (om.profitFactor < 1.2 || om.maxDrawdownPct > 35) {
         status = 'DEGRADED';
       }
-
-      const labelMap: Record<Timeframe, string> = {
-        '1m': '1 Minuto',
-        '5m': '5 Minuti',
-        '15m': '15 Minuti (Intraday Veloce)',
-        '30m': '30 Minuti (Intraday Medio)',
-        '1h': '1 Ora (Swing Breve)',
-        '2h': '2 Ore (Swing Medio-Breve)',
-        '4h': '4 Ore (Swing Medio)',
-        '1D': '1 Giorno (Daily Swing)',
-      };
 
       rows.push({
         timeframe: tf,
@@ -718,13 +717,15 @@ export function runCrossTimeframeMatrix(
       continue;
     }
 
-    // Generate or fetch bars for other timeframes
-    const bars = generateHistoricalBars(
-      instrument,
-      tf,
-      preset.dateRange.startDate,
-      preset.dateRange.endDate
-    );
+    // Strictly use real bars supplied for this timeframe (or derive real 2h/4h from real 1h bars)
+    let bars: Bar[] | undefined = barsByTimeframe?.[tf];
+    if ((!bars || bars.length < 25) && (tf === '2h' || tf === '4h') && barsByTimeframe?.['1h'] && barsByTimeframe['1h'].length >= 40) {
+      bars = aggregateHourlyBars(barsByTimeframe['1h'], tf).bars;
+    }
+    if (!bars || bars.length < 25) {
+      // Strict real-data policy: never invent synthetic bars for missing timeframes
+      continue;
+    }
 
     const res = runBacktest(strategy, instrument, tf, bars, preset.params);
     const m = res.metrics;
@@ -736,17 +737,6 @@ export function runCrossTimeframeMatrix(
     } else if (m.profitFactor < 1.2 || m.maxDrawdownPct > 35) {
       status = 'DEGRADED';
     }
-
-    const labelMap: Record<Timeframe, string> = {
-      '1m': '1 Minuto',
-      '5m': '5 Minuti',
-      '15m': '15 Minuti (Intraday Veloce)',
-      '30m': '30 Minuti (Intraday Medio)',
-      '1h': '1 Ora (Swing Breve)',
-      '2h': '2 Ore (Swing Medio-Breve)',
-      '4h': '4 Ore (Swing Medio)',
-      '1D': '1 Giorno (Daily Swing)',
-    };
 
     rows.push({
       timeframe: tf,
@@ -771,7 +761,8 @@ export function runCrossTimeframeMatrix(
  */
 export function runCrossPeriodMatrix(
   preset: SavedStrategyPreset,
-  instrument: Instrument
+  instrument: Instrument,
+  realBars?: Bar[]
 ): PeriodComparisonRow[] {
   const strategy = getStrategyById(preset.strategyId);
   if (!strategy) return [];
@@ -783,34 +774,6 @@ export function runCrossPeriodMatrix(
     endDate: string;
     regimeType: 'BULL' | 'BEAR' | 'SIDEWAYS' | 'RECENT' | 'FULL_CYCLE';
   }[] = [
-    {
-      key: '1M',
-      label: 'Ultimo Mese (Recente)',
-      startDate: '2026-07-28',
-      endDate: '2026-08-28',
-      regimeType: 'RECENT',
-    },
-    {
-      key: '3M',
-      label: 'Ultimi 3 Mesi',
-      startDate: '2026-05-28',
-      endDate: '2026-08-28',
-      regimeType: 'RECENT',
-    },
-    {
-      key: '6M',
-      label: 'Ultimi 6 Mesi',
-      startDate: '2026-02-28',
-      endDate: '2026-08-28',
-      regimeType: 'RECENT',
-    },
-    {
-      key: '1Y',
-      label: 'Ultimo Anno (12 Mesi)',
-      startDate: '2025-08-28',
-      endDate: '2026-08-28',
-      regimeType: 'RECENT',
-    },
     {
       key: '2022_BEAR',
       label: 'Mercato Orso 2022 (Stress Test Inflazione)',
@@ -826,10 +789,17 @@ export function runCrossPeriodMatrix(
       regimeType: 'BULL',
     },
     {
+      key: '2025_RECENT',
+      label: 'Regime 2025 (Recente)',
+      startDate: '2025-01-02',
+      endDate: '2025-12-31',
+      regimeType: 'RECENT',
+    },
+    {
       key: 'FULL_CYCLE',
-      label: 'Ciclo Completo Multi-Anno (2019 - 2026)',
-      startDate: '2019-01-02',
-      endDate: '2026-08-28',
+      label: 'Intero Periodo Storico Reale Disponibile',
+      startDate: preset.dateRange.startDate,
+      endDate: preset.dateRange.endDate,
       regimeType: 'FULL_CYCLE',
     },
   ];
@@ -839,10 +809,8 @@ export function runCrossPeriodMatrix(
   for (const p of periodConfigs) {
     const isCalibrationPeriod =
       (preset.dateRange.startDate === p.startDate && preset.dateRange.endDate === p.endDate) ||
-      (preset.dateRange.label ? preset.dateRange.label.includes(p.key) : false);
+      p.key === 'FULL_CYCLE';
 
-    // When evaluating the exact calibration period on which the strategy was optimized,
-    // strictly use the original metrics so results are 100% identical!
     if (isCalibrationPeriod && preset.originalMetrics) {
       const om = preset.originalMetrics;
       const isProfitable = om.totalReturnPct > 0;
@@ -873,8 +841,13 @@ export function runCrossPeriodMatrix(
       continue;
     }
 
-    const bars = generateHistoricalBars(instrument, preset.timeframe, p.startDate, p.endDate);
-    const res = runBacktest(strategy, instrument, preset.timeframe, bars, preset.params);
+    if (!realBars || realBars.length < 30) continue;
+    const startMs = Date.parse(`${p.startDate}T00:00:00Z`);
+    const endMs = Date.parse(`${p.endDate}T23:59:59Z`);
+    const slice = realBars.filter((b) => b.timestamp >= startMs && b.timestamp <= endMs);
+    if (slice.length < 30) continue;
+
+    const res = runBacktest(strategy, instrument, preset.timeframe, slice, preset.params);
     const m = res.metrics;
     const isProfitable = m.totalReturnPct > 0;
 
@@ -914,35 +887,29 @@ export function runCrossPeriodMatrix(
 export function runCrossAssetMatrix(
   preset: SavedStrategyPreset,
   extraInstruments?: Instrument[],
-  baseAssetBars?: Bar[]
+  baseAssetBars?: Bar[],
+  barsByTicker?: Record<string, Bar[]>
 ): AssetComparisonRow[] {
   const strategy = getStrategyById(preset.strategyId);
   if (!strategy) return [];
 
-  // Default benchmarks if not provided
-  const targetList: Instrument[] = [];
+  const targetList: Instrument[] = [preset.instrument];
 
-  // Always include the baseline instrument first
-  targetList.push(preset.instrument);
-
-  // Pick representative assets from the database
-  const benchmarkTickers = ['SPY', 'QQQ', 'VWCE.DE', 'GLD', 'BTP.MI', 'ENEL.MI', 'AAPL'];
-  for (const ticker of benchmarkTickers) {
-    if (ticker.toUpperCase() !== preset.instrument.ticker.toUpperCase()) {
-      const found = INSTRUMENTS_DATABASE.find(
-        (inst) => inst.ticker.toUpperCase() === ticker.toUpperCase()
-      );
-      if (found && !targetList.some((t) => t.ticker.toUpperCase() === found.ticker.toUpperCase())) {
-        targetList.push(found);
-      }
-    }
-  }
-
-  // Append any user-provided extra instruments
   if (extraInstruments && extraInstruments.length > 0) {
     for (const inst of extraInstruments) {
       if (!targetList.some((t) => t.ticker.toUpperCase() === inst.ticker.toUpperCase())) {
         targetList.push(inst);
+      }
+    }
+  }
+
+  if (barsByTicker) {
+    for (const ticker of Object.keys(barsByTicker)) {
+      if (!targetList.some((t) => t.ticker.toUpperCase() === ticker.toUpperCase())) {
+        const found = INSTRUMENTS_DATABASE.find(
+          (i) => i.ticker.toUpperCase() === ticker.toUpperCase()
+        );
+        if (found) targetList.push(found);
       }
     }
   }
@@ -954,8 +921,6 @@ export function runCrossAssetMatrix(
       inst.ticker.toUpperCase() === preset.instrument.ticker.toUpperCase() ||
       (Boolean(inst.id) && Boolean(preset.instrument.id) && inst.id === preset.instrument.id);
 
-    // CRITICAL: When evaluating the base asset on which this strategy was optimized,
-    // the backtest metrics must be strictly IDENTICAL to the original optimization run results!
     if (isBaseAsset && preset.originalMetrics) {
       const om = preset.originalMetrics;
       const isProfitable = om.totalReturnPct > 0;
@@ -967,7 +932,7 @@ export function runCrossAssetMatrix(
       }
 
       rows.push({
-        instrument: preset.instrument, // retains full original instrument name and metadata
+        instrument: preset.instrument,
         assetClass: preset.instrument.sector || preset.instrument.type || 'Azionario',
         totalReturnPct: parseFloat(om.totalReturnPct.toFixed(2)),
         profitFactor: parseFloat(om.profitFactor.toFixed(2)),
@@ -981,15 +946,15 @@ export function runCrossAssetMatrix(
       continue;
     }
 
-    // For other assets, generate historical bars (or use baseAssetBars if isBaseAsset)
-    const bars = (isBaseAsset && baseAssetBars && baseAssetBars.length >= 10)
-      ? baseAssetBars
-      : generateHistoricalBars(
-          inst,
-          preset.timeframe,
-          preset.dateRange.startDate,
-          preset.dateRange.endDate
-        );
+    // Strict real-data policy: only evaluate peer assets when real historical bars are provided
+    const bars =
+      (isBaseAsset && baseAssetBars && baseAssetBars.length >= 25
+        ? baseAssetBars
+        : barsByTicker?.[inst.ticker] || barsByTicker?.[inst.ticker.toUpperCase()]);
+
+    if (!bars || bars.length < 25) {
+      continue;
+    }
 
     const res = runBacktest(strategy, inst, preset.timeframe, bars, preset.params);
     const m = res.metrics;
@@ -1020,16 +985,18 @@ export function runCrossAssetMatrix(
 }
 
 /**
- * 4. Computes the Complete Quantitative Robustness Audit (Unger Method)
+ * 4. Computes the Complete Quantitative Robustness Audit (Unger Method) strictly on real bars
  */
 export function auditStrategyRobustness(
   preset: SavedStrategyPreset,
   extraInstruments?: Instrument[],
-  baseAssetBars?: Bar[]
+  baseAssetBars?: Bar[],
+  barsByTimeframe?: Partial<Record<Timeframe, Bar[]>>,
+  barsByTicker?: Record<string, Bar[]>
 ): StrategyRobustnessAudit {
-  const timeframeRows = runCrossTimeframeMatrix(preset, preset.instrument);
-  const periodRows = runCrossPeriodMatrix(preset, preset.instrument);
-  const assetRows = runCrossAssetMatrix(preset, extraInstruments, baseAssetBars);
+  const timeframeRows = runCrossTimeframeMatrix(preset, preset.instrument, barsByTimeframe);
+  const periodRows = runCrossPeriodMatrix(preset, preset.instrument, baseAssetBars);
+  const assetRows = runCrossAssetMatrix(preset, extraInstruments, baseAssetBars, barsByTicker);
 
   // Compute pass ratios (excluding baseline/calibration rows from denominator or accounting for them)
   const nonBaseTfs = timeframeRows.filter((r) => !r.isBaseline);

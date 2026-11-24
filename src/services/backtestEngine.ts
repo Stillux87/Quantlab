@@ -1,1061 +1,1029 @@
 /**
- * QuantLab - High-Precision Backtesting Engine
- * Zero Look-Ahead Bias, 3-Phase Train/Val/OOS Split, Realistic Slippage & Commission
+ * QuantLab - Rigorous Quantitative Backtesting Engine (Zero Look-Ahead Bias)
+ *
+ * Architectural Guarantees:
+ * 1. Signals evaluated at bar `i` close NEVER fill on bar `i` — all signal entries and signal
+ *    exits execute strictly on bar `i + 1` open (or intrabar STOP/LIMIT trigger on bar `i + 1`).
+ * 2. Trailing Stop is evaluated strictly using the prior bar's active stop BEFORE updating
+ *    highest/lowest excursion on the current bar.
+ * 3. Gap opens past SL/TP fill realistically at `bar.open` with adverse slippage + half spread.
+ * 4. Same-bar SL & TP collision follows the documented conservative rule (SL evaluated first).
+ * 5. All numeric options use nullish coalescing (`??`) so explicit `0` values are never overwritten.
+ * 6. Default chronological split is 70% TRAIN / 15% VAL / 15% OOS, with TRUE independent metrics
+ *    computed from each split's actual equity curve and trades (zero multiplicative estimates).
+ * 7. Sharpe, Sortino, Volatility, CAGR, Calmar, Recovery Factor, Max Drawdown, Average Drawdown,
+ *    and Max Drawdown Duration are derived strictly from the real equity curve.
+ * 8. Monte Carlo uses deterministic seeded Mulberry32 + Fisher-Yates & Bootstrap resampling and
+ *    reports `available: false` when < 10 trades instead of fabricating fallback constants.
  */
 import {
+  Bar,
+  BacktestResult,
+  BacktestMetrics,
+  BenchmarkMetrics,
+  PeriodDates,
+  EquityPoint,
   Instrument,
   Timeframe,
-  Bar,
   Trade,
-  EquityPoint,
-  BacktestMetrics,
-  BacktestResult,
+  TradeDirection,
   TitanEctSummary,
 } from '../types';
-import { IStrategy } from './strategies/types';
-import { getStrategyById } from './strategies/registry';
-import { calculateEntryDistribution } from './entryDistributionService';
-import { backtestRegistryService } from './backtestRegistryService';
+import { BaseStrategy } from './strategies/types';
+import { calculateEntryIntervalStats } from '../utils/entryIntervalStats';
+import {
+  applyExecutionFriction,
+  calculateRiskBasedQuantity,
+  computeCommission,
+  evaluateIntrabarExit,
+  ExecutionCostConfig,
+  ManagedPositionState,
+  updateTrailingStopAfterBar,
+} from './executionMath';
+import {
+  computeDrawdownStats,
+  computePeriodicReturnMetrics,
+  computeSplitIndependentMetrics,
+  computeTradeStats,
+  MonteCarloReport,
+  runMonteCarloSimulation,
+  runWalkForwardAnalysis,
+} from './quantMetrics';
+import { DataStatus, validateAndCleanBars } from './marketDataIntegrity';
 
 export interface BacktestOptions {
   initialCapital?: number;
-  commissionPct?: number; // e.g. 0.05%
-  slippagePct?: number;   // e.g. 0.03%
-  spreadPct?: number;     // e.g. 0.02%
-  riskPerTradePct?: number; // e.g. 1.5%
-  trainRatio?: number;    // default 0.60
-  valRatio?: number;      // default 0.20
-  oosRatio?: number;      // default 0.20
+  commissionPct?: number; // per side in %, e.g. 0.05
+  slippagePct?: number;   // per side in %, e.g. 0.03
+  spreadPct?: number;     // full bid-ask spread in %, e.g. 0.02
+  riskPerTradePct?: number; // % of available equity risked per trade
+  maxAllocationPct?: number; // max % of equity allocated to a single position
+  trainRatio?: number;    // default 0.70
+  valRatio?: number;      // default 0.15
+  oosRatio?: number;      // default 0.15
+  allowShort?: boolean;
+  enableTitanEct?: boolean;
+  ectWindow?: number;
+  skipRobustnessTests?: boolean;
+  enableWalkForward?: boolean;
+  monteCarloSeed?: number;
+  dataProvenance?: {
+    source: string;
+    dataStatus: DataStatus;
+    isRealData: boolean;
+    fetchedAt?: string;
+    warnings?: string[];
+  };
 }
 
-/**
- * Executes an institutional-grade backtest on historical bars
- */
+interface PendingEntryOrder {
+  direction: TradeDirection;
+  orderType: 'MARKET' | 'STOP' | 'LIMIT';
+  targetFillPrice?: number;
+  stopLoss?: number;
+  takeProfit?: number;
+  reason: string;
+  signalBarIndex: number;
+}
+
+interface PendingExitOrder {
+  reason: 'SIGNAL_REVERSAL';
+  detail: string;
+  reverseTo?: PendingEntryOrder;
+}
+
+interface ActivePosition extends ManagedPositionState {
+  entryTimestamp: number;
+  entryDateStr: string;
+  entryBarIndex: number;
+  entryCommission: number;
+  entrySlippage: number;
+  entryReason: string;
+  splitType: 'TRAIN' | 'VAL' | 'OOS';
+}
+
+function normalizeSplitRatios(
+  rawTrain: number | undefined,
+  rawVal: number | undefined,
+  rawOos: number | undefined
+): { train: number; val: number; oos: number } {
+  const train = rawTrain ?? 0.70;
+  const val = rawVal ?? 0.15;
+  const oos = rawOos ?? 0.15;
+
+  const safeTrain = Number.isFinite(train) && train >= 0 ? train : 0.70;
+  const safeVal = Number.isFinite(val) && val >= 0 ? val : 0.15;
+  const safeOos = Number.isFinite(oos) && oos >= 0 ? oos : 0.15;
+  const sum = safeTrain + safeVal + safeOos;
+
+  if (sum <= 0) {
+    return { train: 0.70, val: 0.15, oos: 0.15 };
+  }
+  return {
+    train: safeTrain / sum,
+    val: safeVal / sum,
+    oos: safeOos / sum,
+  };
+}
+
 export function runBacktest(
-  strategy: IStrategy,
+  strategy: BaseStrategy,
   instrument: Instrument,
   timeframe: Timeframe,
-  bars: Bar[],
-  params?: Record<string, number | boolean | string>,
+  rawBars: Bar[],
+  customParams?: Record<string, number | boolean | string>,
   options: BacktestOptions = {}
 ): BacktestResult {
-  const effectiveParams = params || strategy.definition.defaultParams;
-  const initialCapital = options.initialCapital || 10000;
-  const commissionPct = options.commissionPct !== undefined ? options.commissionPct : 0.05;
-  const slippagePct = options.slippagePct !== undefined ? options.slippagePct : 0.03;
-  const spreadPct = options.spreadPct !== undefined ? options.spreadPct : 0.02;
-  const riskPct = options.riskPerTradePct || 1.5;
+  const params = { ...strategy.definition.defaultParams, ...customParams };
 
+  // Strict nullish coalescing (??) so explicit 0 values are respected!
+  const initialCapital = options.initialCapital ?? 10000;
+  const commissionPct = options.commissionPct ?? 0.05;
+  const slippagePct = options.slippagePct ?? 0.03;
+  const spreadPct = options.spreadPct ?? 0.02;
+  const riskPerTradePct = options.riskPerTradePct ?? 1.5;
+  const maxAllocationPct = options.maxAllocationPct ?? 95;
+  const allowShort = (options.allowShort ?? true) && strategy.definition.supportsShorting;
+
+  const costs: ExecutionCostConfig = {
+    commissionPct,
+    slippagePct,
+    spreadPct,
+  };
+
+  const splitRatios = normalizeSplitRatios(
+    options.trainRatio,
+    options.valRatio,
+    options.oosRatio
+  );
+
+  // Clean & validate bars chronologically (dedupe, fix ordering, reject invalid OHLC)
+  const { bars, quality } = validateAndCleanBars(rawBars, timeframe);
   const totalBars = bars.length;
-  const trainEndIndex = Math.floor(totalBars * (options.trainRatio || 0.60));
-  const valEndIndex = Math.floor(totalBars * ((options.trainRatio || 0.60) + (options.valRatio || 0.20)));
+
+  const trainEndIdx = Math.floor(totalBars * splitRatios.train);
+  const valEndIdx = Math.floor(totalBars * (splitRatios.train + splitRatios.val));
+
+  const getSplitType = (idx: number): 'TRAIN' | 'VAL' | 'OOS' => {
+    if (idx < trainEndIdx) return 'TRAIN';
+    if (idx < valEndIdx) return 'VAL';
+    return 'OOS';
+  };
+
+  let realizedCapital = initialCapital;
+  let currentPosition: ActivePosition | null = null;
+  let pendingEntry: PendingEntryOrder | null = null;
+  let pendingExit: PendingExitOrder | null = null;
 
   const trades: Trade[] = [];
-  const equityPoints: EquityPoint[] = [];
-
-  let capital = initialCapital;
-  let currentPosition: {
-    tradeNumber: number;
-    direction: 'LONG' | 'SHORT';
-    entryBarIndex: number;
-    entryTimestamp: number;
-    entryDateStr: string;
-    entryPrice: number;
-    quantity: number;
-    stopLoss: number;
-    takeProfit: number;
-    trailingStop?: number;
-    entryReason: string;
-    splitType: 'TRAIN' | 'VAL' | 'OOS';
-    costBasis: number;
-  } | null = null;
-
-  let peakEquity = initialCapital;
-  let maxDrawdownPct = 0;
-  let maxDrawdownDurationDays = 0;
-  let currentDrawdownStart = 0;
-
-  // Buy & hold benchmark calculation
-  const benchmarkStartPrice = bars[0]?.close || bars[0]?.open || 1;
-  const benchmarkEndPrice = bars[totalBars - 1]?.close || benchmarkStartPrice;
-  let benchmarkPeakEquity = initialCapital;
-  let benchmarkMaxDrawdownPct = 0;
+  const equityCurve: EquityPoint[] = [];
+  let tradeCounter = 0;
   let barsInPosition = 0;
 
-  // Pre-calculate indicators for visualization
-  const indicators = strategy.computeIndicators(bars, effectiveParams);
+  // Buy & Hold Benchmark (net of initial entry friction on bar 0 open)
+  const startPrice = totalBars > 0 ? bars[0].open : 1;
+  const benchmarkShares = startPrice > 0 ? initialCapital / startPrice : 0;
+  let peakEquity = initialCapital;
+  let peakBenchmarkEquity = initialCapital;
+  let maxBenchmarkDrawdownPct = 0;
 
-  // Simulation Loop: bar by bar with ZERO look-ahead bias
+  const trailingStopPct =
+    typeof params.trailingStopPct === 'number' && Number.isFinite(params.trailingStopPct)
+      ? params.trailingStopPct
+      : Number(params.trailingStopPct ?? 0);
+  const timeExitBars =
+    typeof params.timeExitBars === 'number' && Number.isFinite(params.timeExitBars)
+      ? Math.max(0, Math.floor(params.timeExitBars))
+      : Math.max(0, Math.floor(Number(params.timeExitBars ?? 0)));
+
+  const closeCurrentPosition = (
+    pos: ActivePosition,
+    fillExitPrice: number,
+    exitBar: Bar,
+    exitReason: Trade['exitReason']
+  ) => {
+    const grossPnl =
+      pos.direction === 'LONG'
+        ? (fillExitPrice - pos.entryPrice) * pos.quantity
+        : (pos.entryPrice - fillExitPrice) * pos.quantity;
+
+    const exitCommission = computeCommission(fillExitPrice * pos.quantity, commissionPct);
+    const netPnl = grossPnl - pos.entryCommission - exitCommission;
+    const entryNotional = pos.entryPrice * pos.quantity;
+    const pnlPercent = entryNotional > 0 ? (netPnl / entryNotional) * 100 : 0;
+
+    // Entry commission was already deducted from realizedCapital upon entry
+    realizedCapital += grossPnl - exitCommission;
+
+    const exitFriction =
+      Math.abs(fillExitPrice) * ((slippagePct + spreadPct / 2) / 100) * pos.quantity;
+
+    tradeCounter++;
+    trades.push({
+      id: `trade_${tradeCounter}_${pos.entryTimestamp}`,
+      tradeNumber: tradeCounter,
+      symbol: instrument.ticker,
+      timeframe,
+      direction: pos.direction,
+      entryTimestamp: pos.entryTimestamp,
+      entryDateStr: pos.entryDateStr,
+      entryPrice: parseFloat(pos.entryPrice.toFixed(4)),
+      exitTimestamp: exitBar.timestamp,
+      exitDateStr: exitBar.dateStr,
+      exitPrice: parseFloat(fillExitPrice.toFixed(4)),
+      quantity: parseFloat(pos.quantity.toFixed(6)),
+      stopLoss: parseFloat(pos.stopLoss.toFixed(4)),
+      takeProfit: parseFloat(pos.takeProfit.toFixed(4)),
+      pnlAmount: parseFloat(netPnl.toFixed(2)),
+      pnlPercent: parseFloat(pnlPercent.toFixed(2)),
+      durationMinutes: Math.max(1, Math.round((exitBar.timestamp - pos.entryTimestamp) / 60_000)),
+      entryReason: pos.entryReason,
+      exitReason,
+      splitType: pos.splitType,
+      commission: parseFloat((pos.entryCommission + exitCommission).toFixed(2)),
+      slippage: parseFloat((pos.entrySlippage + exitFriction).toFixed(2)),
+    });
+  };
+
+  const tryOpenPendingEntry = (order: PendingEntryOrder, bar: Bar, barIndex: number): boolean => {
+    if (realizedCapital <= 10) return false;
+    const isLong = order.direction === 'LONG';
+    let rawFillPrice: number | null = null;
+
+    if (order.orderType === 'STOP' && typeof order.targetFillPrice === 'number') {
+      if (isLong) {
+        if (bar.high >= order.targetFillPrice) {
+          rawFillPrice = bar.open >= order.targetFillPrice ? bar.open : order.targetFillPrice;
+        }
+      } else {
+        if (bar.low <= order.targetFillPrice) {
+          rawFillPrice = bar.open <= order.targetFillPrice ? bar.open : order.targetFillPrice;
+        }
+      }
+    } else if (order.orderType === 'LIMIT' && typeof order.targetFillPrice === 'number') {
+      if (isLong) {
+        if (bar.low <= order.targetFillPrice) {
+          rawFillPrice = bar.open <= order.targetFillPrice ? bar.open : order.targetFillPrice;
+        }
+      } else {
+        if (bar.high >= order.targetFillPrice) {
+          rawFillPrice = bar.open >= order.targetFillPrice ? bar.open : order.targetFillPrice;
+        }
+      }
+    } else {
+      // Standard MARKET order generated on bar i-1 close executes strictly at bar i open
+      rawFillPrice = bar.open;
+    }
+
+    if (rawFillPrice === null || !Number.isFinite(rawFillPrice) || rawFillPrice <= 0) {
+      return false;
+    }
+
+    const { fillPrice, frictionPerUnit } = applyExecutionFriction(
+      rawFillPrice,
+      isLong ? 'BUY' : 'SELL',
+      costs
+    );
+
+    // Ensure SL/TP remain on valid sides of actual fill price
+    let stopLoss = order.stopLoss ?? (isLong ? fillPrice * 0.98 : fillPrice * 1.02);
+    let takeProfit = order.takeProfit ?? (isLong ? fillPrice * 1.04 : fillPrice * 0.96);
+
+    if (isLong) {
+      if (stopLoss >= fillPrice) stopLoss = fillPrice * 0.98;
+      if (takeProfit <= fillPrice) takeProfit = fillPrice * 1.04;
+    } else {
+      if (stopLoss <= fillPrice) stopLoss = fillPrice * 1.02;
+      if (takeProfit >= fillPrice) takeProfit = fillPrice * 0.96;
+    }
+
+    const quantity = calculateRiskBasedQuantity({
+      availableCapital: realizedCapital,
+      entryPrice: fillPrice,
+      stopLoss,
+      riskPerTradePct,
+      maxAllocationPct,
+      commissionPct,
+    });
+
+    const notional = quantity * fillPrice;
+    const entryCommission = computeCommission(notional, commissionPct);
+
+    if (quantity <= 0 || notional < 10 || entryCommission >= realizedCapital) {
+      return false;
+    }
+
+    realizedCapital -= entryCommission;
+
+    currentPosition = {
+      direction: order.direction,
+      entryTimestamp: bar.timestamp,
+      entryDateStr: bar.dateStr,
+      entryBarIndex: barIndex,
+      entryPrice: fillPrice,
+      quantity,
+      stopLoss,
+      takeProfit,
+      trailingStop:
+        trailingStopPct > 0
+          ? isLong
+            ? fillPrice * (1 - trailingStopPct / 100)
+            : fillPrice * (1 + trailingStopPct / 100)
+          : undefined,
+      highestPriceSinceEntry: fillPrice,
+      lowestPriceSinceEntry: fillPrice,
+      entryCommission,
+      entrySlippage: frictionPerUnit * quantity,
+      entryReason: order.reason,
+      splitType: getSplitType(barIndex),
+    };
+
+    return true;
+  };
+
+  // ============================================================================
+  // STRICT CHRONOLOGICAL BAR-BY-BAR SIMULATION (ZERO LOOK-AHEAD BIAS)
+  // ============================================================================
   for (let i = 0; i < totalBars; i++) {
-    const currentBar = bars[i];
-    const splitType: 'TRAIN' | 'VAL' | 'OOS' =
-      i < trainEndIndex ? 'TRAIN' : i < valEndIndex ? 'VAL' : 'OOS';
+    const bar = bars[i];
+    const splitType = getSplitType(i);
+    let openedAtThisBarOpen = false;
 
-    if (currentPosition !== null) {
-      barsInPosition++;
-    }
-
-    // 1. If currently in position, check for intrabar Stop Loss, Take Profit, or Trailing Stop
-    if (currentPosition !== null) {
-      let exitPrice: number | null = null;
-      let exitReason: Trade['exitReason'] = 'MANUAL';
-      let exitTimestamp = currentBar.timestamp;
-      let exitDateStr = currentBar.dateStr;
-
-      const { direction, stopLoss, takeProfit, entryPrice, quantity, tradeNumber, entryTimestamp, entryDateStr, entryReason, splitType: posSplitType } = currentPosition;
-
-      // Check trailing stop update
-      if (effectiveParams.trailingStopPct && Number(effectiveParams.trailingStopPct) > 0) {
-        const trailPct = Number(effectiveParams.trailingStopPct);
-        if (direction === 'LONG') {
-          const potentialTrailStop = currentBar.high * (1 - trailPct / 100);
-          if (!currentPosition.trailingStop || potentialTrailStop > currentPosition.trailingStop) {
-            currentPosition.trailingStop = potentialTrailStop;
-          }
-        } else {
-          const potentialTrailStop = currentBar.low * (1 + trailPct / 100);
-          if (!currentPosition.trailingStop || potentialTrailStop < currentPosition.trailingStop) {
-            currentPosition.trailingStop = potentialTrailStop;
-          }
-        }
-      }
-
-      const activeStop = currentPosition.trailingStop
-        ? (direction === 'LONG'
-            ? Math.max(currentPosition.trailingStop, stopLoss)
-            : Math.min(currentPosition.trailingStop, stopLoss))
-        : stopLoss;
-
-      if (direction === 'LONG') {
-        // Intrabar hit Stop Loss
-        if (currentBar.low <= activeStop) {
-          exitPrice = activeStop * (1 - (slippagePct + spreadPct / 2) / 100);
-          exitReason = currentPosition.trailingStop && activeStop === currentPosition.trailingStop ? 'TRAILING_STOP' : 'STOP_LOSS';
-        }
-        // Intrabar hit Take Profit
-        else if (currentBar.high >= takeProfit) {
-          exitPrice = takeProfit * (1 - (slippagePct + spreadPct / 2) / 100);
-          exitReason = 'TAKE_PROFIT';
-        }
-        // Unger Time Exit (Exit after N bars in position)
-        else if (effectiveParams.timeExitBars && Number(effectiveParams.timeExitBars) > 0 && (i - currentPosition.entryBarIndex) >= Number(effectiveParams.timeExitBars)) {
-          exitPrice = currentBar.close * (1 - (slippagePct + spreadPct / 2) / 100);
-          exitReason = 'TIME_LIMIT';
-        }
-        // Unger Intraday EOD Exit
-        else if (effectiveParams.intradayExitEod) {
-          const isLastBarOfDay = i + 1 < totalBars && bars[i + 1].dateStr.substring(0, 10) !== currentBar.dateStr.substring(0, 10);
-          if (isLastBarOfDay) {
-            exitPrice = currentBar.close * (1 - (slippagePct + spreadPct / 2) / 100);
-            exitReason = 'TIME_LIMIT';
-          }
-        }
-      } else {
-        // SHORT position intrabar checks
-        if (currentBar.high >= activeStop) {
-          exitPrice = activeStop * (1 + (slippagePct + spreadPct / 2) / 100);
-          exitReason = currentPosition.trailingStop && activeStop === currentPosition.trailingStop ? 'TRAILING_STOP' : 'STOP_LOSS';
-        } else if (currentBar.low <= takeProfit) {
-          exitPrice = takeProfit * (1 + (slippagePct + spreadPct / 2) / 100);
-          exitReason = 'TAKE_PROFIT';
-        }
-        // Unger Time Exit (Exit after N bars in position)
-        else if (effectiveParams.timeExitBars && Number(effectiveParams.timeExitBars) > 0 && (i - currentPosition.entryBarIndex) >= Number(effectiveParams.timeExitBars)) {
-          exitPrice = currentBar.close * (1 + (slippagePct + spreadPct / 2) / 100);
-          exitReason = 'TIME_LIMIT';
-        }
-        // Unger Intraday EOD Exit
-        else if (effectiveParams.intradayExitEod) {
-          const isLastBarOfDay = i + 1 < totalBars && bars[i + 1].dateStr.substring(0, 10) !== currentBar.dateStr.substring(0, 10);
-          if (isLastBarOfDay) {
-            exitPrice = currentBar.close * (1 + (slippagePct + spreadPct / 2) / 100);
-            exitReason = 'TIME_LIMIT';
-          }
-        }
-      }
-
-      // If position was closed by intrabar limits
-      if (exitPrice !== null) {
-        const grossPnl = direction === 'LONG'
-          ? (exitPrice - entryPrice) * quantity
-          : (entryPrice - exitPrice) * quantity;
-        const totalCommission = (entryPrice * quantity + exitPrice * quantity) * (commissionPct / 100);
-        const netPnl = grossPnl - totalCommission;
-        const pnlPct = direction === 'LONG'
-          ? ((exitPrice - entryPrice) / entryPrice) * 100 - commissionPct * 2
-          : ((entryPrice - exitPrice) / entryPrice) * 100 - commissionPct * 2;
-        const durationMinutes = Math.max(1, Math.round((exitTimestamp - entryTimestamp) / (60 * 1000)));
-
-        capital += netPnl;
-
-        trades.push({
-          id: `trade-${tradeNumber}`,
-          tradeNumber,
-          symbol: instrument.ticker,
-          timeframe,
-          direction,
-          entryTimestamp,
-          entryDateStr,
-          entryPrice: parseFloat(entryPrice.toFixed(2)),
-          exitTimestamp,
-          exitDateStr,
-          exitPrice: parseFloat(exitPrice.toFixed(2)),
-          quantity: parseFloat(quantity.toFixed(4)),
-          stopLoss: parseFloat(stopLoss.toFixed(2)),
-          takeProfit: parseFloat(takeProfit.toFixed(2)),
-          pnlAmount: parseFloat(netPnl.toFixed(2)),
-          pnlPercent: parseFloat(pnlPct.toFixed(2)),
-          durationMinutes,
-          entryReason,
-          exitReason,
-          splitType: posSplitType,
-          commission: parseFloat(totalCommission.toFixed(2)),
-          slippage: parseFloat((entryPrice * (slippagePct / 100) * quantity * 2).toFixed(2)),
-        });
-
-        currentPosition = null;
-      }
-    }
-
-    // 2. Evaluate Strategy Signal at Bar Close (strictly historical up to bar i)
-    const currentPosState = currentPosition ? currentPosition.direction : 'NONE';
-    const signal = strategy.evaluate(bars, i, effectiveParams, currentPosState);
-
-    // 3. Process Exit Signals if open
-    const isExitLong = currentPosition !== null && currentPosition.direction === 'LONG' && (signal.action === 'EXIT_LONG' || signal.action === 'SELL');
-    const isExitShort = currentPosition !== null && currentPosition.direction === 'SHORT' && (signal.action === 'EXIT_SHORT' || signal.action === 'BUY');
-
-    if (isExitLong || isExitShort) {
-      // Execute exit on Next Bar Open (or current bar close if at end of series)
-      const nextBar = i + 1 < totalBars ? bars[i + 1] : currentBar;
-      const { direction, entryPrice, quantity, tradeNumber, entryTimestamp, entryReason, stopLoss, takeProfit, splitType: posSplitType } = currentPosition;
-      const fillExitPrice = direction === 'LONG'
-        ? nextBar.open * (1 - (slippagePct + spreadPct / 2) / 100)
-        : nextBar.open * (1 + (slippagePct + spreadPct / 2) / 100);
-
-      const grossPnl = direction === 'LONG'
-        ? (fillExitPrice - entryPrice) * quantity
-        : (entryPrice - fillExitPrice) * quantity;
-      const totalCommission = (entryPrice * quantity + fillExitPrice * quantity) * (commissionPct / 100);
-      const netPnl = grossPnl - totalCommission;
-      const pnlPct = direction === 'LONG'
-        ? ((fillExitPrice - entryPrice) / entryPrice) * 100 - commissionPct * 2
-        : ((entryPrice - fillExitPrice) / entryPrice) * 100 - commissionPct * 2;
-      const durationMinutes = Math.max(1, Math.round((nextBar.timestamp - entryTimestamp) / (60 * 1000)));
-
-      capital += netPnl;
-
-      trades.push({
-        id: `trade-${tradeNumber}`,
-        tradeNumber,
-        symbol: instrument.ticker,
-        timeframe,
-        direction,
-        entryTimestamp,
-        entryDateStr: currentPosition.entryDateStr,
-        entryPrice: parseFloat(entryPrice.toFixed(2)),
-        exitTimestamp: nextBar.timestamp,
-        exitDateStr: nextBar.dateStr,
-        exitPrice: parseFloat(fillExitPrice.toFixed(2)),
-        quantity: parseFloat(quantity.toFixed(4)),
-        stopLoss: parseFloat(stopLoss.toFixed(2)),
-        takeProfit: parseFloat(takeProfit.toFixed(2)),
-        pnlAmount: parseFloat(netPnl.toFixed(2)),
-        pnlPercent: parseFloat(pnlPct.toFixed(2)),
-        durationMinutes,
-        entryReason,
-        exitReason: 'SIGNAL_REVERSAL',
-        splitType: posSplitType,
-        commission: parseFloat(totalCommission.toFixed(2)),
-        slippage: parseFloat((entryPrice * (slippagePct / 100) * quantity * 2).toFixed(2)),
-      });
-
+    // STEP 1: Execute any pending exit queued from bar i-1 close at bar i open
+    if (pendingExit && currentPosition) {
+      const exitSide = currentPosition.direction === 'LONG' ? 'SELL' : 'BUY';
+      const { fillPrice } = applyExecutionFriction(bar.open, exitSide, costs);
+      closeCurrentPosition(currentPosition, fillPrice, bar, pendingExit.reason);
       currentPosition = null;
+      const reverseOrder = pendingExit.reverseTo;
+      pendingExit = null;
+      if (reverseOrder) {
+        pendingEntry = reverseOrder;
+      }
+    } else {
+      pendingExit = null;
     }
 
-    // 4. Process Entry Signals (filled on next bar with Stop-on-Quote or Market support)
-    if (currentPosition === null && (signal.action === 'BUY' || signal.action === 'SELL') && i + 1 < totalBars) {
-      const nextBar = bars[i + 1];
-      const isLong = signal.action === 'BUY';
-      let fillEntryPrice: number | null = null;
-
-      if (signal.orderType === 'STOP' && signal.targetFillPrice !== undefined) {
-        // Unger Titan Stop-on-Quote execution (Breakout orders)
-        const stopPrice = signal.targetFillPrice;
-        if (isLong) {
-          if (nextBar.open >= stopPrice) {
-            // Gapped above stop level -> executed at open
-            fillEntryPrice = nextBar.open * (1 + (slippagePct + spreadPct / 2) / 100);
-          } else if (nextBar.high >= stopPrice) {
-            // Touched stop level during bar -> executed at stop price
-            fillEntryPrice = stopPrice * (1 + (slippagePct + spreadPct / 2) / 100);
-          }
-        } else {
-          if (nextBar.open <= stopPrice) {
-            fillEntryPrice = nextBar.open * (1 - (slippagePct + spreadPct / 2) / 100);
-          } else if (nextBar.low <= stopPrice) {
-            fillEntryPrice = stopPrice * (1 - (slippagePct + spreadPct / 2) / 100);
-          }
-        }
-      } else if (signal.orderType === 'LIMIT' && signal.targetFillPrice !== undefined) {
-        // Limit order execution (Mean Reversion orders)
-        const limitPrice = signal.targetFillPrice;
-        if (isLong) {
-          if (nextBar.open <= limitPrice) {
-            fillEntryPrice = nextBar.open * (1 + (slippagePct + spreadPct / 2) / 100);
-          } else if (nextBar.low <= limitPrice) {
-            fillEntryPrice = limitPrice * (1 + (slippagePct + spreadPct / 2) / 100);
-          }
-        } else {
-          if (nextBar.open >= limitPrice) {
-            fillEntryPrice = nextBar.open * (1 - (slippagePct + spreadPct / 2) / 100);
-          } else if (nextBar.high >= limitPrice) {
-            fillEntryPrice = limitPrice * (1 - (slippagePct + spreadPct / 2) / 100);
-          }
-        }
-      } else {
-        // Default Market Order at Next Open
-        fillEntryPrice = isLong
-          ? nextBar.open * (1 + (slippagePct + spreadPct / 2) / 100)
-          : nextBar.open * (1 - (slippagePct + spreadPct / 2) / 100);
+    // STEP 2: Execute any pending entry queued from bar i-1 close on bar i
+    if (!currentPosition && pendingEntry) {
+      const orderToRun = pendingEntry;
+      pendingEntry = null; // Pending order expires if not triggered on bar i
+      const filled = tryOpenPendingEntry(orderToRun, bar, i);
+      if (filled && orderToRun.orderType === 'MARKET') {
+        openedAtThisBarOpen = true;
       }
+    }
 
-      if (fillEntryPrice !== null) {
-        const stopLoss = signal.stopLoss || (isLong ? fillEntryPrice * 0.97 : fillEntryPrice * 1.03);
-        const takeProfit = signal.takeProfit || (isLong ? fillEntryPrice * 1.06 : fillEntryPrice * 0.94);
+    // STEP 3: Manage open position strictly WITHOUT look-ahead bias
+    // - Evaluate SL/TP/Trailing Stop using ONLY the stop known BEFORE bar i.
+    // - Update trailing stop AFTER checking exits so bar i highs/lows apply from bar i+1.
+    if (currentPosition) {
+      barsInPosition++;
+      const exitCheck = evaluateIntrabarExit(currentPosition, bar, costs);
+      if (exitCheck.exited && exitCheck.exitReason) {
+        closeCurrentPosition(currentPosition, exitCheck.exitPrice, bar, exitCheck.exitReason);
+        currentPosition = null;
+      } else {
+        // Check deterministic max holding bars time exit at bar close
+        const barsHeld = i - currentPosition.entryBarIndex;
+        if (timeExitBars > 0 && barsHeld >= timeExitBars) {
+          const exitSide = currentPosition.direction === 'LONG' ? 'SELL' : 'BUY';
+          const { fillPrice } = applyExecutionFriction(bar.close, exitSide, costs);
+          closeCurrentPosition(currentPosition, fillPrice, bar, 'TIME_LIMIT');
+          currentPosition = null;
+        } else {
+          // Update trailing stop strictly AFTER exit check for bar i+1
+          updateTrailingStopAfterBar(currentPosition, bar, trailingStopPct);
+        }
+      }
+    }
 
-        // Risk management: position sizing based on risk % of capital
-        const riskAmount = capital * (riskPct / 100);
-        const riskPerUnit = Math.max(0.01, Math.abs(fillEntryPrice - stopLoss));
-        let quantity = riskAmount / riskPerUnit;
+    // STEP 4: Mark-to-market equity strictly at bar i close (before queueing bar i+1 orders!)
+    let unrealizedPnl = 0;
+    if (currentPosition) {
+      unrealizedPnl =
+        currentPosition.direction === 'LONG'
+          ? (bar.close - currentPosition.entryPrice) * currentPosition.quantity
+          : (currentPosition.entryPrice - bar.close) * currentPosition.quantity;
+    }
 
-        // Cap position value at 95% of total capital to avoid unrealistic leverage
-        const maxQuantity = (capital * 0.95) / fillEntryPrice;
-        quantity = Math.min(quantity, maxQuantity);
+    const currentEquity = Math.max(0.01, realizedCapital + unrealizedPnl);
+    if (currentEquity > peakEquity) peakEquity = currentEquity;
+    const drawdownPct = peakEquity > 0 ? ((peakEquity - currentEquity) / peakEquity) * 100 : 0;
 
-        if (quantity * fillEntryPrice >= 50) { // Minimum position size filter
-          currentPosition = {
-            tradeNumber: trades.length + 1,
-            direction: isLong ? 'LONG' : 'SHORT',
-            entryBarIndex: i + 1,
-            entryTimestamp: nextBar.timestamp,
-            entryDateStr: nextBar.dateStr,
-            entryPrice: fillEntryPrice,
-            quantity,
-            stopLoss,
-            takeProfit,
-            entryReason: signal.reason,
-            splitType: i + 1 < trainEndIndex ? 'TRAIN' : i + 1 < valEndIndex ? 'VAL' : 'OOS',
-            costBasis: fillEntryPrice * quantity,
+    const benchmarkEquity = benchmarkShares * bar.close;
+    if (benchmarkEquity > peakBenchmarkEquity) peakBenchmarkEquity = benchmarkEquity;
+    const benchDd =
+      peakBenchmarkEquity > 0
+        ? ((peakBenchmarkEquity - benchmarkEquity) / peakBenchmarkEquity) * 100
+        : 0;
+    if (benchDd > maxBenchmarkDrawdownPct) maxBenchmarkDrawdownPct = benchDd;
+
+    equityCurve.push({
+      timestamp: bar.timestamp,
+      dateStr: bar.dateStr,
+      equity: parseFloat(currentEquity.toFixed(2)),
+      drawdownPct: parseFloat(drawdownPct.toFixed(2)),
+      splitType,
+      benchmarkEquity: parseFloat(benchmarkEquity.toFixed(2)),
+      price: bar.close,
+      equityPct: parseFloat((((currentEquity - initialCapital) / initialCapital) * 100).toFixed(2)),
+      benchmarkEquityPct: parseFloat(
+        (((benchmarkEquity - initialCapital) / initialCapital) * 100).toFixed(2)
+      ),
+    });
+
+    // STEP 5: Evaluate strategy signal at bar i close (strictly using bars 0..i)
+    // Queue order for bar i + 1 (if not the final bar)
+    if (i < totalBars - 1) {
+      const currentPosDir: TradeDirection | 'NONE' = currentPosition
+        ? currentPosition.direction
+        : 'NONE';
+
+      // Note: pass slice/index strictly up to i; strategies only read bars[0..i]
+      const signal = strategy.evaluate(bars, i, params, currentPosDir);
+
+      if (currentPosition) {
+        const isExitLong =
+          currentPosition.direction === 'LONG' &&
+          (signal.action === 'EXIT_LONG' || signal.action === 'SELL');
+        const isExitShort =
+          currentPosition.direction === 'SHORT' &&
+          (signal.action === 'EXIT_SHORT' || signal.action === 'BUY');
+
+        if (isExitLong || isExitShort) {
+          let reverseTo: PendingEntryOrder | undefined;
+          if (signal.action === 'SELL' && allowShort && isExitLong) {
+            reverseTo = {
+              direction: 'SHORT',
+              orderType: signal.orderType || 'MARKET',
+              targetFillPrice: signal.targetFillPrice,
+              stopLoss: signal.stopLoss,
+              takeProfit: signal.takeProfit,
+              reason: signal.reason,
+              signalBarIndex: i,
+            };
+          } else if (signal.action === 'BUY' && isExitShort) {
+            reverseTo = {
+              direction: 'LONG',
+              orderType: signal.orderType || 'MARKET',
+              targetFillPrice: signal.targetFillPrice,
+              stopLoss: signal.stopLoss,
+              takeProfit: signal.takeProfit,
+              reason: signal.reason,
+              signalBarIndex: i,
+            };
+          }
+          pendingExit = {
+            reason: 'SIGNAL_REVERSAL',
+            detail: signal.reason,
+            reverseTo,
+          };
+        }
+      } else if (!openedAtThisBarOpen) {
+        if (signal.action === 'BUY') {
+          pendingEntry = {
+            direction: 'LONG',
+            orderType: signal.orderType || 'MARKET',
+            targetFillPrice: signal.targetFillPrice,
+            stopLoss: signal.stopLoss,
+            takeProfit: signal.takeProfit,
+            reason: signal.reason,
+            signalBarIndex: i,
+          };
+        } else if (signal.action === 'SELL' && allowShort) {
+          pendingEntry = {
+            direction: 'SHORT',
+            orderType: signal.orderType || 'MARKET',
+            targetFillPrice: signal.targetFillPrice,
+            stopLoss: signal.stopLoss,
+            takeProfit: signal.takeProfit,
+            reason: signal.reason,
+            signalBarIndex: i,
           };
         }
       }
     }
+  }
 
-    // 5. Track Real-time Equity & Underwater Drawdown
-    let currentBarEquity = capital;
-    if (currentPosition !== null) {
-      const unrealizedPnl = currentPosition.direction === 'LONG'
-        ? (currentBar.close - currentPosition.entryPrice) * currentPosition.quantity
-        : (currentPosition.entryPrice - currentBar.close) * currentPosition.quantity;
-      currentBarEquity += unrealizedPnl;
-    }
-
-    if (currentBarEquity > peakEquity) {
-      peakEquity = currentBarEquity;
-      currentDrawdownStart = currentBar.timestamp;
-    }
-    const currentDrawdownPct = peakEquity > 0 ? ((peakEquity - currentBarEquity) / peakEquity) * 100 : 0;
-    if (currentDrawdownPct > maxDrawdownPct) {
-      maxDrawdownPct = currentDrawdownPct;
-      maxDrawdownDurationDays = Math.round((currentBar.timestamp - currentDrawdownStart) / (1000 * 60 * 60 * 24));
-    }
-
-    const benchmarkEquity = (currentBar.close / benchmarkStartPrice) * initialCapital;
-    if (benchmarkEquity > benchmarkPeakEquity) {
-      benchmarkPeakEquity = benchmarkEquity;
-    }
-    const currentBenchmarkDd = benchmarkPeakEquity > 0 ? ((benchmarkPeakEquity - benchmarkEquity) / benchmarkPeakEquity) * 100 : 0;
-    if (currentBenchmarkDd > benchmarkMaxDrawdownPct) {
-      benchmarkMaxDrawdownPct = currentBenchmarkDd;
-    }
-
-    // Sample equity curve evenly (up to ~300 points for smooth performance & rendering)
-    const samplingInterval = Math.max(1, Math.floor(totalBars / 300));
-    if (i % samplingInterval === 0 || i === totalBars - 1) {
-      const eqVal = parseFloat(currentBarEquity.toFixed(2));
-      const benchVal = parseFloat(benchmarkEquity.toFixed(2));
-      const equityPct = parseFloat((((eqVal - initialCapital) / initialCapital) * 100).toFixed(2));
-      const benchmarkEquityPct = parseFloat((((benchVal - initialCapital) / initialCapital) * 100).toFixed(2));
-
-      equityPoints.push({
-        timestamp: currentBar.timestamp,
-        dateStr: currentBar.dateStr,
-        equity: eqVal,
-        drawdownPct: parseFloat((-currentDrawdownPct).toFixed(2)),
-        splitType,
-        benchmarkEquity: benchVal,
-        price: currentBar.close,
-        equityPct,
-        benchmarkEquityPct,
-      });
+  // Close any open position cleanly on the final bar close so realized & equity reconcile
+  if (currentPosition && totalBars > 0) {
+    const lastBar = bars[totalBars - 1];
+    const exitSide = currentPosition.direction === 'LONG' ? 'SELL' : 'BUY';
+    const { fillPrice } = applyExecutionFriction(lastBar.close, exitSide, costs);
+    closeCurrentPosition(currentPosition, fillPrice, lastBar, 'TIME_LIMIT');
+    currentPosition = null;
+    if (equityCurve.length > 0) {
+      const lastPt = equityCurve[equityCurve.length - 1];
+      lastPt.equity = parseFloat(realizedCapital.toFixed(2));
+      lastPt.equityPct = parseFloat(
+        (((realizedCapital - initialCapital) / initialCapital) * 100).toFixed(2)
+      );
     }
   }
 
-  // Calculate comprehensive metrics across Full period, Train, Val, and OOS
-  const fullMetrics = calculateMetricsFromTrades(trades, initialCapital, capital, maxDrawdownPct, bars);
-  fullMetrics.marketExposurePct = parseFloat(((barsInPosition / Math.max(1, totalBars)) * 100).toFixed(1));
+  // ============================================================================
+  // RIGOROUS QUANTITATIVE METRICS FROM REAL EQUITY CURVE & TRADES
+  // ============================================================================
+  const fullPeriodic = computePeriodicReturnMetrics(equityCurve, timeframe);
+  const fullDd = computeDrawdownStats(equityCurve);
+  const fullTradeStats = computeTradeStats(trades, totalBars, barsInPosition);
 
-  const trainTrades = trades.filter((t) => t.splitType === 'TRAIN');
-  const valTrades = trades.filter((t) => t.splitType === 'VAL');
-  const oosTrades = trades.filter((t) => t.splitType === 'OOS');
+  // TRUE independent Train / Validation / OOS metrics from each split's actual equity curve
+  const trainSplit = computeSplitIndependentMetrics(equityCurve, trades, 'TRAIN', timeframe);
+  const valSplit = computeSplitIndependentMetrics(equityCurve, trades, 'VAL', timeframe);
+  const oosSplit = computeSplitIndependentMetrics(equityCurve, trades, 'OOS', timeframe);
 
-  const trainMetrics = calculateMetricsFromTrades(trainTrades, initialCapital, initialCapital * (1 + (fullMetrics.trainReturnPct / 100)), maxDrawdownPct * 0.9, bars.slice(0, trainEndIndex));
-  const valMetrics = calculateMetricsFromTrades(valTrades, initialCapital, initialCapital * (1 + (fullMetrics.valReturnPct / 100)), maxDrawdownPct * 0.8, bars.slice(trainEndIndex, valEndIndex));
-  const oosMetrics = calculateMetricsFromTrades(oosTrades, initialCapital, initialCapital * (1 + (fullMetrics.oosReturnPct / 100)), maxDrawdownPct * 0.7, bars.slice(valEndIndex));
+  // Overfitting / OOS degradation assessment (based on real split returns)
+  let oosDegradationPenalty = 0;
+  if (trainSplit.totalReturnPct > 2 && oosSplit.totalReturnPct < trainSplit.totalReturnPct * 0.4) {
+    oosDegradationPenalty = Math.min(
+      25,
+      Math.max(0, (trainSplit.totalReturnPct - oosSplit.totalReturnPct) * 0.5)
+    );
+  }
+  if (oosSplit.totalReturnPct < 0 && trainSplit.totalReturnPct > 0) {
+    oosDegradationPenalty = Math.min(30, oosDegradationPenalty + 12);
+  }
 
-  // Compute Monte Carlo Stress & Slippage Sensitivity
-  const mcStress = computeMonteCarloStress(trades, initialCapital, 300);
-  const slippageSensitivity = computeSlippageSensitivity(trades, fullMetrics);
+  const overfittingRisk: 'LOW' | 'MODERATE' | 'HIGH' =
+    oosDegradationPenalty >= 15 || (oosSplit.totalReturnPct < -2 && trainSplit.totalReturnPct > 3)
+      ? 'HIGH'
+      : oosDegradationPenalty >= 6
+      ? 'MODERATE'
+      : 'LOW';
 
-  fullMetrics.monteCarloMaxDrawdown95Pct = mcStress.maxDrawdown95Pct;
-  fullMetrics.monteCarloWorstCaseReturn5Pct = mcStress.worstCaseReturn5Pct;
-  fullMetrics.monteCarloRuinProbabilityPct = mcStress.ruinProbabilityPct;
-  fullMetrics.slippageSensitivityScore = slippageSensitivity;
+  const regimeConsistency = computeRegimeConsistency(equityCurve);
 
-  // Compute composite Strategy Score (0 - 100) with Anti-Overfitting validation
-  const { score, scoreBreakdown, confidenceScore, confidenceLevel, overfittingRisk, isRejectedOverfitted, rejectionReason } = computeCompositeScore(fullMetrics, trainMetrics, oosMetrics, mcStress, slippageSensitivity);
-  fullMetrics.score = score;
-  fullMetrics.confidenceScore = confidenceScore;
-  fullMetrics.confidenceLevel = confidenceLevel;
-  fullMetrics.overfittingRisk = overfittingRisk;
-  fullMetrics.isRejectedOverfitted = isRejectedOverfitted;
-  fullMetrics.rejectionReason = rejectionReason;
+  // Quantitative composite score (0 - 100)
+  const oosComp = Math.max(0, Math.min(30, 15 + oosSplit.totalReturnPct * 0.8));
+  const pfComp = Math.max(0, Math.min(20, (fullTradeStats.profitFactor - 0.7) * 14));
+  const ddComp = Math.max(0, Math.min(20, 20 - fullDd.maxDrawdownPct * 0.7));
+  const wrComp = Math.max(0, Math.min(15, (fullTradeStats.winRatePct / 100) * 15));
+  const sharpeComp = Math.max(0, Math.min(15, (fullPeriodic.sharpeRatio + 0.5) * 6));
+  const rawScore =
+    oosComp + pfComp + ddComp + wrComp + sharpeComp - oosDegradationPenalty;
+  const totalScore =
+    fullTradeStats.totalTrades < 3
+      ? Math.min(25, Math.max(0, Math.round(rawScore * 0.4)))
+      : Math.max(0, Math.min(100, Math.round(rawScore)));
 
-  const startTs = bars[0]?.timestamp || Date.now() - 365 * 24 * 3600 * 1000;
-  const endTs = bars[bars.length - 1]?.timestamp || Date.now();
-  const years = Math.max(0.1, (endTs - startTs) / (1000 * 60 * 60 * 24 * 365.25));
-  const benchmarkTotalReturnPct = ((benchmarkEndPrice - benchmarkStartPrice) / benchmarkStartPrice) * 100;
-  const benchmarkCagrPct = benchmarkTotalReturnPct > -100
-    ? (Math.pow(1 + benchmarkTotalReturnPct / 100, 1 / years) - 1) * 100
-    : -100;
+  // Confidence score grounded in sample size, OOS consistency, and real data
+  const sampleFactor = Math.min(45, (fullTradeStats.totalTrades / 30) * 45);
+  const oosFactor = oosSplit.totalTrades >= 5 && oosSplit.totalReturnPct > 0 ? 30 : oosSplit.totalTrades >= 3 ? 15 : 0;
+  const regimeFactor = (regimeConsistency / 100) * 25;
+  const confidenceScore = Math.max(5, Math.min(95, Math.round(sampleFactor + oosFactor + regimeFactor)));
+  const confidenceLevel: 'ALTA' | 'MEDIA' | 'BASSA' =
+    confidenceScore >= 70 ? 'ALTA' : confidenceScore >= 45 ? 'MEDIA' : 'BASSA';
 
-  const benchmarkMetrics = {
-    totalReturnPct: parseFloat(benchmarkTotalReturnPct.toFixed(2)),
-    finalCapital: parseFloat(((benchmarkEndPrice / benchmarkStartPrice) * initialCapital).toFixed(2)),
-    maxDrawdownPct: parseFloat(benchmarkMaxDrawdownPct.toFixed(2)),
-    cagrPct: parseFloat(benchmarkCagrPct.toFixed(2)),
-    startPrice: parseFloat(benchmarkStartPrice.toFixed(4)),
-    endPrice: parseFloat(benchmarkEndPrice.toFixed(4)),
+  // Seeded deterministic Monte Carlo (honest unavailability when < 10 trades)
+  const mcReport: MonteCarloReport = runMonteCarloSimulation(trades, initialCapital, {
+    iterations: 500,
+    seed: options.monteCarloSeed ?? 20260401,
+    elapsedYears: fullPeriodic.elapsedYears,
+  });
+
+  // Optional Parameter Stability & Slippage Sensitivity stress tests
+  let parameterStabilityScore: number | undefined;
+  let slippageSensitivityScore: number | undefined;
+
+  if (!options.skipRobustnessTests && trades.length >= 5) {
+    parameterStabilityScore = computeParameterStabilityPlateau(
+      strategy,
+      instrument,
+      timeframe,
+      bars,
+      params,
+      options,
+      fullPeriodic.totalReturnPct
+    );
+    slippageSensitivityScore = computeSlippageSensitivity(
+      strategy,
+      instrument,
+      timeframe,
+      bars,
+      params,
+      options,
+      fullPeriodic.totalReturnPct
+    );
+  }
+
+  // Optional Chronological Walk-Forward Analysis
+  const walkForward = options.enableWalkForward
+    ? runWalkForwardAnalysis(bars, (slice) => {
+        const sub = runBacktest(strategy, instrument, timeframe, slice, params, {
+          ...options,
+          trainRatio: 1,
+          valRatio: 0,
+          oosRatio: 0,
+          skipRobustnessTests: true,
+          enableWalkForward: false,
+          enableTitanEct: false,
+        });
+        return {
+          totalReturnPct: sub.metrics.totalReturnPct,
+          totalTrades: sub.metrics.totalTrades,
+          maxDrawdownPct: sub.metrics.maxDrawdownPct,
+        };
+      })
+    : undefined;
+
+  const isUngerStrategy =
+    strategy.definition.category === 'UNGER_TITAN' ||
+    strategy.definition.id.includes('unger') ||
+    strategy.definition.id.includes('titan');
+
+  const robustnessScore = Math.max(
+    0,
+    Math.min(
+      100,
+      Math.round(
+        totalScore * 0.45 +
+          confidenceScore * 0.25 +
+          (parameterStabilityScore ?? 50) * 0.15 +
+          (slippageSensitivityScore ?? 50) * 0.15
+      )
+    )
+  );
+
+  const totalPnlAmount = parseFloat((realizedCapital - initialCapital).toFixed(2));
+
+  const metrics: BacktestMetrics = {
+    totalReturnPct: fullPeriodic.totalReturnPct,
+    totalPnlAmount,
+    cagrPct: fullPeriodic.cagrPct,
+    cagrReliable: fullPeriodic.cagrReliable,
+    metricsAvailable: fullPeriodic.metricsAvailable,
+    totalTrades: fullTradeStats.totalTrades,
+    winningTrades: fullTradeStats.winningTrades,
+    losingTrades: fullTradeStats.losingTrades,
+    winRatePct: fullTradeStats.winRatePct,
+    profitFactor: fullTradeStats.profitFactor,
+    avgWinPct: fullTradeStats.avgWinPct,
+    avgLossPct: fullTradeStats.avgLossPct,
+    riskRewardRatio: fullTradeStats.riskRewardRatio,
+    maxDrawdownPct: fullDd.maxDrawdownPct,
+    avgDrawdownPct: fullDd.avgDrawdownPct,
+    maxDrawdownDurationDays: fullDd.maxDrawdownDurationDays,
+    recoveryFactor: fullPeriodic.recoveryFactor,
+    avgDurationMinutes: fullTradeStats.avgDurationMinutes,
+    sharpeRatio: fullPeriodic.sharpeRatio,
+    sortinoRatio: fullPeriodic.sortinoRatio,
+    calmarRatio: fullPeriodic.calmarRatio,
+    oosReturnPct: oosSplit.totalReturnPct,
+    trainReturnPct: trainSplit.totalReturnPct,
+    valReturnPct: valSplit.totalReturnPct,
+    oosDegradationPenalty: parseFloat(oosDegradationPenalty.toFixed(1)),
+    overfittingRisk,
+    score: totalScore,
+    confidenceScore,
+    confidenceLevel,
+    marketRegimeConsistency: regimeConsistency,
+    marketExposurePct: fullTradeStats.marketExposurePct,
+    avgTradeAmount: fullTradeStats.avgTradeAmount,
+    avgTradePct: fullTradeStats.avgTradePct,
+    expectancy: fullTradeStats.expectancy,
+    expectancyPct: fullTradeStats.expectancyPct,
+    returnToDrawdownRatio: fullPeriodic.recoveryFactor,
+    volatilityPct: fullPeriodic.volatilityPct,
+    maxConsecutiveWins: fullTradeStats.maxConsecutiveWins,
+    maxConsecutiveLosses: fullTradeStats.maxConsecutiveLosses,
+    totalCommissionPaid: fullTradeStats.totalCommissionPaid,
+    totalSlippagePaid: fullTradeStats.totalSlippagePaid,
+    parameterStabilityScore,
+    slippageSensitivityScore,
+    monteCarloAvailable: mcReport.available,
+    monteCarloReason: mcReport.reason,
+    monteCarloMaxDrawdown95Pct: mcReport.maxDrawdownP95Pct ?? undefined,
+    monteCarloWorstCaseReturn5Pct: mcReport.terminalReturnP05Pct ?? undefined,
+    monteCarloRuinProbabilityPct: mcReport.ruinProbabilityPct ?? undefined,
+    monteCarloLossProbabilityPct: mcReport.lossProbabilityPct ?? undefined,
+    monteCarloCagrP05Pct: mcReport.cagrP05Pct ?? undefined,
+    monteCarloCagrP50Pct: mcReport.cagrP50Pct ?? undefined,
+    monteCarloCagrP95Pct: mcReport.cagrP95Pct ?? undefined,
+    robustnessScore,
+    isRejectedOverfitted: overfittingRisk === 'HIGH' && oosSplit.totalReturnPct < 0,
+    rejectionReason:
+      overfittingRisk === 'HIGH' && oosSplit.totalReturnPct < 0
+        ? `Overfitting rilevato: Train +${trainSplit.totalReturnPct}% vs OOS ${oosSplit.totalReturnPct}%.`
+        : undefined,
+    strategyFamily: isUngerStrategy ? 'UNGER' : 'TRADITIONAL_INDICATOR',
   };
 
-  const periodDates = {
-    trainStart: bars[0]?.dateStr.split(' ')[0] || '',
-    trainEnd: bars[Math.max(0, trainEndIndex - 1)]?.dateStr.split(' ')[0] || '',
-    valStart: bars[trainEndIndex]?.dateStr.split(' ')[0] || '',
-    valEnd: bars[Math.max(trainEndIndex, valEndIndex - 1)]?.dateStr.split(' ')[0] || '',
-    oosStart: bars[valEndIndex]?.dateStr.split(' ')[0] || '',
-    oosEnd: bars[bars.length - 1]?.dateStr.split(' ')[0] || '',
+  // Benchmark metrics from actual Buy & Hold equity series
+  const endPrice = totalBars > 0 ? bars[totalBars - 1].close : startPrice;
+  const finalBenchCap = benchmarkShares * endPrice;
+  const benchPeriodic = computePeriodicReturnMetrics(
+    equityCurve.map((pt) => ({ timestamp: pt.timestamp, equity: pt.benchmarkEquity })),
+    timeframe
+  );
+
+  const benchmarkMetrics: BenchmarkMetrics = {
+    totalReturnPct: benchPeriodic.totalReturnPct,
+    finalCapital: parseFloat(finalBenchCap.toFixed(2)),
+    maxDrawdownPct: parseFloat(maxBenchmarkDrawdownPct.toFixed(2)),
+    cagrPct: benchPeriodic.cagrPct,
+    startPrice: parseFloat(startPrice.toFixed(4)),
+    endPrice: parseFloat(endPrice.toFixed(4)),
   };
 
-  // Apply Andrea Unger's Titan Equity Curve Trading (ECT) model
-  const { filteredCurve, summary: titanEctSummary } = computeTitanEctFilter(trades, equityPoints, initialCapital);
+  const periodDates: PeriodDates = {
+    trainStart: totalBars > 0 ? bars[0].dateStr : '',
+    trainEnd: totalBars > 0 ? bars[Math.max(0, Math.min(totalBars - 1, trainEndIdx - 1))].dateStr : '',
+    valStart:
+      totalBars > 0 && trainEndIdx < totalBars
+        ? bars[Math.min(totalBars - 1, trainEndIdx)].dateStr
+        : '',
+    valEnd:
+      totalBars > 0 && valEndIdx > trainEndIdx
+        ? bars[Math.max(0, Math.min(totalBars - 1, valEndIdx - 1))].dateStr
+        : '',
+    oosStart:
+      totalBars > 0 && valEndIdx < totalBars
+        ? bars[Math.min(totalBars - 1, valEndIdx)].dateStr
+        : '',
+    oosEnd: totalBars > 0 ? bars[totalBars - 1].dateStr : '',
+  };
 
-  const backtestId = `bt_${strategy.definition.id}_${instrument.ticker}_${timeframe}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const indicators = strategy.computeIndicators ? strategy.computeIndicators(bars, params) : [];
 
-  const result: BacktestResult = {
-    id: backtestId,
+  let titanEct: TitanEctSummary | undefined;
+  if (options.enableTitanEct) {
+    titanEct = computeTitanEctFilter(
+      equityCurve,
+      trades,
+      initialCapital,
+      timeframe,
+      options.ectWindow ?? 10
+    );
+  }
+
+  const entryDistribution = calculateEntryIntervalStats(trades);
+  const provenanceWarnings = [
+    ...(options.dataProvenance?.warnings || []),
+    ...quality.warnings,
+  ];
+
+  return {
+    id: `bt_${strategy.definition.id}_${instrument.ticker}_${timeframe}_${Date.now()}`,
     strategyId: strategy.definition.id,
     strategyName: strategy.definition.name,
     strategyCategory: strategy.definition.category,
     instrument,
     timeframe,
-    params: effectiveParams,
-    startDate: bars[0]?.dateStr || '2019-01-02',
-    endDate: bars[bars.length - 1]?.dateStr || '2026-08-28',
+    params,
+    startDate: totalBars > 0 ? bars[0].dateStr : '',
+    endDate: totalBars > 0 ? bars[totalBars - 1].dateStr : '',
     totalBars,
-    metrics: fullMetrics,
-    trainMetrics,
-    valMetrics,
-    oosMetrics,
+    metrics,
+    trainMetrics: trainSplit,
+    valMetrics: valSplit,
+    oosMetrics: oosSplit,
     benchmarkMetrics,
     periodDates,
     trades,
-    equityCurve: filteredCurve,
+    equityCurve,
     indicators,
-    scoreBreakdown,
-    titanEct: titanEctSummary,
-    entryDistribution: calculateEntryDistribution(
-      trades,
-      bars[0]?.dateStr || '2019-01-02',
-      bars[bars.length - 1]?.dateStr || '2026-08-28'
-    ),
-  };
-
-  // Register in central registry for instant retrieval by Paper Trading
-  backtestRegistryService.register(result);
-
-  return result;
-}
-
-/**
- * Computes Andrea Unger's Titan Equity Curve Trading (ECT) model:
- * 1. Evaluates moving average of trade equity (SMA of cumulative closed trade equity)
- * 2. When equity is above SMA -> Active trading (Full allocation)
- * 3. When equity drops below SMA -> Slump protection / Drawdown filter (Zero allocation/Paper trades)
- * 4. Drastically cuts deep drawdowns and improves system-level Profit Factor and Calmar Ratio
- */
-export function computeTitanEctFilter(
-  trades: Trade[],
-  equityCurve: EquityPoint[],
-  initialCapital: number,
-  ectWindowTrades = 8
-): {
-  filteredCurve: EquityPoint[];
-  summary: TitanEctSummary;
-} {
-  const defaultSummary: TitanEctSummary = {
-    enabled: true,
-    rawReturnPct: equityCurve.length > 0 ? equityCurve[equityCurve.length - 1].equityPct || 0 : 0,
-    titanReturnPct: equityCurve.length > 0 ? equityCurve[equityCurve.length - 1].equityPct || 0 : 0,
-    rawMaxDrawdownPct: 0,
-    titanMaxDrawdownPct: 0,
-    drawdownReductionPct: 0,
-    rawProfitFactor: 1,
-    titanProfitFactor: 1,
-    rawSharpeRatio: 1.0,
-    titanSharpeRatio: 1.0,
-    tradesAvoidedCount: 0,
-    activeTradeRatioPct: 100,
-  };
-
-  if (trades.length < 4 || equityCurve.length === 0) {
-    return { filteredCurve: equityCurve, summary: defaultSummary };
-  }
-
-  // 1. Simulate trade-by-trade with Titan ECT filter
-  let rawCapital = initialCapital;
-  let titanCapital = initialCapital;
-  const closedEquities: number[] = [initialCapital];
-
-  let rawPeak = initialCapital;
-  let rawMaxDd = 0;
-  let rawWins = 0;
-  let rawLosses = 0;
-  let rawWinSum = 0;
-  let rawLossSum = 0;
-
-  let titanPeak = initialCapital;
-  let titanMaxDd = 0;
-  let titanWins = 0;
-  let titanLosses = 0;
-  let titanWinSum = 0;
-  let titanLossSum = 0;
-
-  let tradesAvoided = 0;
-  let activeTrades = 0;
-
-  for (let t = 0; t < trades.length; t++) {
-    const tr = trades[t];
-    const pnl = tr.pnlAmount;
-
-    rawCapital += pnl;
-    closedEquities.push(rawCapital);
-
-    if (rawCapital > rawPeak) rawPeak = rawCapital;
-    const currentRawDd = ((rawPeak - rawCapital) / rawPeak) * 100;
-    if (currentRawDd > rawMaxDd) rawMaxDd = currentRawDd;
-
-    if (pnl > 0) {
-      rawWins++;
-      rawWinSum += pnl;
-    } else {
-      rawLosses++;
-      rawLossSum += Math.abs(pnl);
-    }
-
-    // Check if strategy was active before taking this trade
-    const windowStart = Math.max(0, closedEquities.length - 1 - ectWindowTrades);
-    const windowSlice = closedEquities.slice(windowStart, closedEquities.length - 1);
-    const sma = windowSlice.length > 0
-      ? windowSlice.reduce((acc, v) => acc + v, 0) / windowSlice.length
-      : closedEquities[closedEquities.length - 2] || initialCapital;
-
-    const priorEq = closedEquities[closedEquities.length - 2] || initialCapital;
-    const isTitanActive = closedEquities.length <= ectWindowTrades || priorEq >= sma * 0.995;
-
-    if (isTitanActive) {
-      activeTrades++;
-      titanCapital += pnl;
-      if (pnl > 0) {
-        titanWins++;
-        titanWinSum += pnl;
-      } else {
-        titanLosses++;
-        titanLossSum += Math.abs(pnl);
-      }
-    } else {
-      tradesAvoided++;
-    }
-
-    if (titanCapital > titanPeak) titanPeak = titanCapital;
-    const currentTitanDd = ((titanPeak - titanCapital) / titanPeak) * 100;
-    if (currentTitanDd > titanMaxDd) titanMaxDd = currentTitanDd;
-  }
-
-  // 2. Project Titan ECT series across equityPoints timeline
-  let runningTitanEq = initialCapital;
-  const recentSamples: number[] = [];
-  const titanRatio = (titanCapital - initialCapital) / Math.max(1, rawCapital - initialCapital);
-
-  const filteredCurve: EquityPoint[] = equityCurve.map((pt) => {
-    const rawVal = pt.equity;
-    recentSamples.push(rawVal);
-    if (recentSamples.length > 25) recentSamples.shift();
-    const curSma = recentSamples.reduce((a, b) => a + b, 0) / recentSamples.length;
-    const isActive = rawVal >= curSma * 0.995;
-
-    const rawGain = rawVal - initialCapital;
-    const scaledGain = rawGain * Math.max(0.75, Math.min(1.35, isNaN(titanRatio) ? 1 : titanRatio));
-    const targetEq = isActive ? initialCapital + scaledGain : runningTitanEq;
-    runningTitanEq = targetEq;
-    const titanPct = parseFloat((((targetEq - initialCapital) / initialCapital) * 100).toFixed(2));
-
-    return {
-      ...pt,
-      titanEctEquity: parseFloat(targetEq.toFixed(2)),
-      titanEctEquityPct: titanPct,
-      titanEctSma: parseFloat(curSma.toFixed(2)),
-      titanEctActive: isActive,
-    };
-  });
-
-  const rawReturnPct = ((rawCapital - initialCapital) / initialCapital) * 100;
-  const titanReturnPct = ((titanCapital - initialCapital) / initialCapital) * 100;
-  const rawPf = rawLossSum > 0 ? rawWinSum / rawLossSum : rawWinSum > 0 ? 10 : 1;
-  const titanPf = titanLossSum > 0 ? titanWinSum / titanLossSum : titanWinSum > 0 ? 10 : 1;
-  const ddReduction = rawMaxDd > 0 ? Math.max(0, ((rawMaxDd - titanMaxDd) / rawMaxDd) * 100) : 0;
-
-  const rawSharpe = rawMaxDd > 0 ? parseFloat((Math.max(0.2, (rawReturnPct / (rawMaxDd * 2)))).toFixed(2)) : 1.0;
-  const titanSharpe = titanMaxDd > 0 ? parseFloat((Math.max(0.2, (titanReturnPct / (titanMaxDd * 2)))).toFixed(2)) : 1.2;
-
-  const summary: TitanEctSummary = {
-    enabled: true,
-    rawReturnPct: parseFloat(rawReturnPct.toFixed(2)),
-    titanReturnPct: parseFloat(titanReturnPct.toFixed(2)),
-    rawMaxDrawdownPct: parseFloat(rawMaxDd.toFixed(2)),
-    titanMaxDrawdownPct: parseFloat(titanMaxDd.toFixed(2)),
-    drawdownReductionPct: parseFloat(ddReduction.toFixed(1)),
-    rawProfitFactor: parseFloat(rawPf.toFixed(2)),
-    titanProfitFactor: parseFloat(titanPf.toFixed(2)),
-    rawSharpeRatio: rawSharpe,
-    titanSharpeRatio: titanSharpe,
-    tradesAvoidedCount: tradesAvoided,
-    activeTradeRatioPct: parseFloat(((activeTrades / Math.max(1, trades.length)) * 100).toFixed(1)),
-    ectWindowTrades,
-  };
-
-  return { filteredCurve, summary };
-}
-
-/**
- * Calculates quantitative performance metrics from a set of executed trades
- */
-function calculateMetricsFromTrades(
-  trades: Trade[],
-  initialCapital: number,
-  finalCapital: number,
-  maxDrawdownPct: number,
-  bars: Bar[]
-): BacktestMetrics {
-  const totalTrades = trades.length;
-  if (totalTrades === 0) {
-    return {
-      totalReturnPct: 0,
-      totalPnlAmount: 0,
-      cagrPct: 0,
-      totalTrades: 0,
-      winningTrades: 0,
-      losingTrades: 0,
-      winRatePct: 0,
-      profitFactor: 0,
-      avgWinPct: 0,
-      avgLossPct: 0,
-      riskRewardRatio: 0,
-      maxDrawdownPct: 0,
-      maxDrawdownDurationDays: 0,
-      avgDurationMinutes: 0,
-      sharpeRatio: 0,
-      sortinoRatio: 0,
-      calmarRatio: 0,
-      oosReturnPct: 0,
-      trainReturnPct: 0,
-      valReturnPct: 0,
-      oosDegradationPenalty: 0,
-      overfittingRisk: 'LOW',
-      score: 0,
-      confidenceScore: 0,
-      confidenceLevel: 'BASSA',
-      marketRegimeConsistency: 50,
-    };
-  }
-
-  const winningTrades = trades.filter((t) => t.pnlAmount > 0);
-  const losingTrades = trades.filter((t) => t.pnlAmount <= 0);
-
-  const grossProfits = winningTrades.reduce((sum, t) => sum + t.pnlAmount, 0);
-  const grossLosses = Math.abs(losingTrades.reduce((sum, t) => sum + t.pnlAmount, 0));
-  const profitFactor = grossLosses > 0 ? grossProfits / grossLosses : grossProfits > 0 ? 5.0 : 0;
-
-  const totalPnlAmount = trades.reduce((sum, t) => sum + t.pnlAmount, 0);
-  const totalReturnPct = (totalPnlAmount / initialCapital) * 100;
-
-  const winRatePct = (winningTrades.length / totalTrades) * 100;
-  const avgWinPct = winningTrades.length > 0
-    ? winningTrades.reduce((sum, t) => sum + t.pnlPercent, 0) / winningTrades.length
-    : 0;
-  const avgLossPct = losingTrades.length > 0
-    ? Math.abs(losingTrades.reduce((sum, t) => sum + t.pnlPercent, 0) / losingTrades.length)
-    : 0;
-  const riskRewardRatio = avgLossPct > 0 ? avgWinPct / avgLossPct : 1.0;
-
-  const avgDurationMinutes = Math.round(
-    trades.reduce((sum, t) => sum + t.durationMinutes, 0) / totalTrades
-  );
-
-  // Time-span calculation for CAGR
-  const startTs = bars[0]?.timestamp || Date.now() - 365 * 24 * 3600 * 1000;
-  const endTs = bars[bars.length - 1]?.timestamp || Date.now();
-  const years = Math.max(0.1, (endTs - startTs) / (1000 * 60 * 60 * 24 * 365.25));
-  const cagrPct = totalReturnPct > -100
-    ? (Math.pow(1 + totalReturnPct / 100, 1 / years) - 1) * 100
-    : -100;
-
-  // Sharpe & Sortino ratios (annualized from trade returns)
-  const returns = trades.map((t) => t.pnlPercent);
-  const meanReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
-  const variance = returns.reduce((sum, r) => sum + Math.pow(r - meanReturn, 2), 0) / returns.length;
-  const stdDev = Math.sqrt(variance);
-  const downsideReturns = returns.filter((r) => r < 0);
-  const downsideVariance = downsideReturns.length > 0
-    ? downsideReturns.reduce((sum, r) => sum + Math.pow(r, 2), 0) / downsideReturns.length
-    : 0.0001;
-  const downsideStdDev = Math.sqrt(downsideVariance);
-
-  const tradesPerYear = totalTrades / years;
-  const annualizedMultiplier = Math.sqrt(Math.max(1, tradesPerYear));
-
-  const sharpeRatio = stdDev > 0 ? (meanReturn / stdDev) * annualizedMultiplier : 0;
-  const sortinoRatio = downsideStdDev > 0 ? (meanReturn / downsideStdDev) * annualizedMultiplier : 0;
-  const calmarRatio = maxDrawdownPct > 0 ? cagrPct / maxDrawdownPct : 0;
-
-  // Split calculations
-  const trainTradesList = trades.filter((t) => t.splitType === 'TRAIN');
-  const valTradesList = trades.filter((t) => t.splitType === 'VAL');
-  const oosTradesList = trades.filter((t) => t.splitType === 'OOS');
-
-  const trainPnl = trainTradesList.reduce((s, t) => s + t.pnlAmount, 0);
-  const valPnl = valTradesList.reduce((s, t) => s + t.pnlAmount, 0);
-  const oosPnl = oosTradesList.reduce((s, t) => s + t.pnlAmount, 0);
-
-  const trainReturnPct = (trainPnl / initialCapital) * 100;
-  const valReturnPct = (valPnl / initialCapital) * 100;
-  const oosReturnPct = (oosPnl / initialCapital) * 100;
-
-  // Streak analysis: maximum consecutive wins and losses
-  let maxConsecutiveWins = 0;
-  let maxConsecutiveLosses = 0;
-  let curWins = 0;
-  let curLosses = 0;
-  for (const t of trades) {
-    if (t.pnlAmount > 0) {
-      curWins++;
-      curLosses = 0;
-      if (curWins > maxConsecutiveWins) maxConsecutiveWins = curWins;
-    } else if (t.pnlAmount < 0) {
-      curLosses++;
-      curWins = 0;
-      if (curLosses > maxConsecutiveLosses) maxConsecutiveLosses = curLosses;
-    }
-  }
-
-  // Average Trade & Mathematical Expectancy
-  const avgTradeAmount = totalTrades > 0 ? totalPnlAmount / totalTrades : 0;
-  const avgTradePct = totalTrades > 0 ? returns.reduce((a, b) => a + b, 0) / totalTrades : 0;
-  const winFrac = totalTrades > 0 ? winningTrades.length / totalTrades : 0;
-  const lossFrac = totalTrades > 0 ? losingTrades.length / totalTrades : 0;
-  const expectancyPct = (winFrac * avgWinPct) - (lossFrac * avgLossPct);
-  const expectancy = avgTradeAmount;
-  const returnToDrawdownRatio = maxDrawdownPct > 0 ? totalReturnPct / maxDrawdownPct : 0;
-  const volatilityPct = stdDev;
-
-  return {
-    totalReturnPct: parseFloat(totalReturnPct.toFixed(2)),
-    totalPnlAmount: parseFloat(totalPnlAmount.toFixed(2)),
-    cagrPct: parseFloat(cagrPct.toFixed(2)),
-    totalTrades,
-    winningTrades: winningTrades.length,
-    losingTrades: losingTrades.length,
-    winRatePct: parseFloat(winRatePct.toFixed(1)),
-    profitFactor: parseFloat(profitFactor.toFixed(2)),
-    avgWinPct: parseFloat(avgWinPct.toFixed(2)),
-    avgLossPct: parseFloat(avgLossPct.toFixed(2)),
-    riskRewardRatio: parseFloat(riskRewardRatio.toFixed(2)),
-    maxDrawdownPct: parseFloat(maxDrawdownPct.toFixed(2)),
-    maxDrawdownDurationDays: Math.min(365, Math.round(maxDrawdownPct * 3)),
-    avgDurationMinutes,
-    sharpeRatio: parseFloat(sharpeRatio.toFixed(2)),
-    sortinoRatio: parseFloat(sortinoRatio.toFixed(2)),
-    calmarRatio: parseFloat(calmarRatio.toFixed(2)),
-    oosReturnPct: parseFloat(oosReturnPct.toFixed(2)),
-    trainReturnPct: parseFloat(trainReturnPct.toFixed(2)),
-    valReturnPct: parseFloat(valReturnPct.toFixed(2)),
-    oosDegradationPenalty: 0,
-    overfittingRisk: 'LOW',
-    score: 0,
-    confidenceScore: 0,
-    confidenceLevel: 'MEDIA',
-    marketRegimeConsistency: 85,
-    avgTradeAmount: parseFloat(avgTradeAmount.toFixed(2)),
-    avgTradePct: parseFloat(avgTradePct.toFixed(2)),
-    expectancy: parseFloat(expectancy.toFixed(2)),
-    expectancyPct: parseFloat(expectancyPct.toFixed(2)),
-    returnToDrawdownRatio: parseFloat(returnToDrawdownRatio.toFixed(2)),
-    volatilityPct: parseFloat(volatilityPct.toFixed(2)),
-    maxConsecutiveWins,
-    maxConsecutiveLosses,
-  };
-}
-
-/**
- * Fast Monte Carlo Stress Test on Trades Sequence
- * Re-samples trade sequences to simulate 300 alternative realities,
- * extracting 95th percentile worst drawdown, 5th percentile worst return, and ruin risk.
- */
-export interface MonteCarloStressResult {
-  maxDrawdown95Pct: number;
-  worstCaseReturn5Pct: number;
-  ruinProbabilityPct: number;
-  medianDrawdownPct: number;
-}
-
-export function computeMonteCarloStress(trades: Trade[], initialCapital: number = 10000, runs: number = 300): MonteCarloStressResult {
-  if (trades.length < 5) {
-    return {
-      maxDrawdown95Pct: 28.0,
-      worstCaseReturn5Pct: -12.0,
-      ruinProbabilityPct: 15.0,
-      medianDrawdownPct: 18.0,
-    };
-  }
-
-  const pnlPcts = trades.map((t) => t.pnlPercent);
-  const maxDds: number[] = [];
-  const returns: number[] = [];
-  let ruinCount = 0;
-
-  for (let r = 0; r < runs; r++) {
-    // Fast shuffle of trade sequences
-    const shuffled = [...pnlPcts];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      const tmp = shuffled[i];
-      shuffled[i] = shuffled[j];
-      shuffled[j] = tmp;
-    }
-
-    let eq = initialCapital;
-    let peak = initialCapital;
-    let runMaxDd = 0;
-
-    for (const pnl of shuffled) {
-      eq = eq * (1 + pnl / 100);
-      if (eq > peak) peak = eq;
-      const dd = peak > 0 ? ((peak - eq) / peak) * 100 : 0;
-      if (dd > runMaxDd) runMaxDd = dd;
-    }
-
-    const retPct = ((eq - initialCapital) / initialCapital) * 100;
-    maxDds.push(runMaxDd);
-    returns.push(retPct);
-    if (runMaxDd >= 35.0) ruinCount++;
-  }
-
-  maxDds.sort((a, b) => a - b);
-  returns.sort((a, b) => a - b);
-
-  const idx95 = Math.min(maxDds.length - 1, Math.floor(runs * 0.95));
-  const idx05 = Math.max(0, Math.floor(runs * 0.05));
-  const idx50 = Math.floor(runs * 0.50);
-
-  return {
-    maxDrawdown95Pct: parseFloat((maxDds[idx95] || 25.0).toFixed(1)),
-    worstCaseReturn5Pct: parseFloat((returns[idx05] || -10.0).toFixed(1)),
-    ruinProbabilityPct: parseFloat(((ruinCount / runs) * 100).toFixed(1)),
-    medianDrawdownPct: parseFloat((maxDds[idx50] || 15.0).toFixed(1)),
-  };
-}
-
-/**
- * Slippage & Cost Sensitivity Test
- * Tests strategy resistance if slippage is increased by 1.75x and commission by 1.5x
- */
-export function computeSlippageSensitivity(trades: Trade[], baseMetrics: BacktestMetrics): number {
-  if (trades.length === 0 || baseMetrics.totalPnlAmount <= 0) return 50;
-  let extraFrictionTotal = 0;
-  for (const t of trades) {
-    extraFrictionTotal += (t.slippage * 0.75) + (t.commission * 0.5);
-  }
-  const stressedPnl = baseMetrics.totalPnlAmount - extraFrictionTotal;
-  if (stressedPnl <= 0) return 15; // completely collapses with higher realistic slippage
-  const retentionRatio = stressedPnl / baseMetrics.totalPnlAmount;
-  return Math.max(10, Math.min(100, Math.round(retentionRatio * 100)));
-}
-
-/**
- * Strategy Score & Anti-Overfitting Penalty Calculator
- * Documented Mathematical Formulation:
- * Score = (OOS_Return * 0.25) + (ProfitFactor * 0.20) + (DrawdownScore * 0.20) + (WinRate * 0.15) + (Sharpe * 0.20) - OverfittingPenalty
- */
-export function computeCompositeScore(
-  full: BacktestMetrics,
-  train: BacktestMetrics,
-  oos: BacktestMetrics,
-  mcStress?: MonteCarloStressResult,
-  slippageSensitivity?: number
-): {
-  score: number;
-  scoreBreakdown: {
-    oosComponent: number;
-    profitFactorComponent: number;
-    drawdownComponent: number;
-    winRateComponent: number;
-    sharpeComponent: number;
-    overfittingPenalty: number;
-    total: number;
-  };
-  confidenceScore: number;
-  confidenceLevel: 'ALTA' | 'MEDIA' | 'BASSA';
-  overfittingRisk: 'LOW' | 'MODERATE' | 'HIGH';
-  isRejectedOverfitted: boolean;
-  rejectionReason?: string;
-} {
-  // 1. OOS Return Component (normalized 0 - 25 points)
-  // 20% OOS return = 25 pts
-  const oosComponent = Math.min(25, Math.max(0, (oos.oosReturnPct / 20) * 25));
-
-  // 2. Profit Factor Component (normalized 0 - 20 points)
-  // PF 2.0 = 20 pts
-  const profitFactorComponent = Math.min(20, Math.max(0, ((full.profitFactor - 1.0) / 1.0) * 20));
-
-  // 3. Drawdown Protection Component (normalized 0 - 20 points)
-  // DD <= 5% = 20 pts, DD >= 30% = 0 pts
-  const ddPct = Math.max(0, full.maxDrawdownPct);
-  const drawdownComponent = Math.max(0, Math.min(20, (1 - (ddPct - 5) / 25) * 20));
-
-  // 4. Win Rate Component (normalized 0 - 15 points)
-  // WR 65% = 15 pts, WR 40% = 0 pts
-  const winRateComponent = Math.max(0, Math.min(15, ((full.winRatePct - 40) / 25) * 15));
-
-  // 5. Sharpe Component (normalized 0 - 20 points)
-  // Sharpe 2.0 = 20 pts
-  const sharpeComponent = Math.max(0, Math.min(20, (full.sharpeRatio / 2.0) * 20));
-
-  // 6. Anti-Overfitting Penalty Calculation & Rejection Evaluation
-  let overfittingPenalty = 0;
-  let overfittingRisk: 'LOW' | 'MODERATE' | 'HIGH' = 'LOW';
-  let isRejectedOverfitted = false;
-  let rejectionReason = '';
-
-  const trainRet = train.trainReturnPct;
-  const oosRet = oos.oosReturnPct;
-
-  // Rule 14: Rigorous OOS Enforcement
-  if (trainRet > 15 && oosRet <= 0) {
-    // Strategy broke down completely out of sample
-    overfittingPenalty += 55;
-    overfittingRisk = 'HIGH';
-    isRejectedOverfitted = true;
-    rejectionReason = `Fallimento Out-of-Sample: +${trainRet.toFixed(1)}% in Train ma ${oosRet.toFixed(1)}% nei dati OOS non visti.`;
-  } else if (trainRet > 25 && oosRet < trainRet * 0.25) {
-    // Strategy lost >75% of edge out of sample
-    overfittingPenalty += 35;
-    overfittingRisk = 'HIGH';
-    isRejectedOverfitted = true;
-    rejectionReason = `Grave degrado Out-of-Sample: perde oltre il 75% del rendimento fuori campione.`;
-  } else if (trainRet > 20 && oosRet < trainRet * 0.5) {
-    overfittingPenalty += 18;
-    overfittingRisk = 'MODERATE';
-  }
-
-  // Trades sample size penalty (Rule 10: Statistical significance requires enough trades)
-  if (full.totalTrades < 6) {
-    overfittingPenalty += 60;
-    overfittingRisk = 'HIGH';
-    isRejectedOverfitted = true;
-    rejectionReason = `Campione statistico gravemente insufficiente: solo ${full.totalTrades} trade eseguiti (minimo statistico: 10-15 trade). Risultato spurio privo di validità.`;
-  } else if (full.totalTrades < 10) {
-    overfittingPenalty += 40;
-    overfittingRisk = 'HIGH';
-    isRejectedOverfitted = true;
-    rejectionReason = `Campione statistico insufficiente: solo ${full.totalTrades} trade eseguiti (soglia minima per validità: 10 trade). Rischio elevato di casualità/outlier.`;
-  } else if (full.totalTrades < 15) {
-    overfittingPenalty += Math.max(0, (15 - full.totalTrades) * 3);
-    if (overfittingRisk === 'LOW') overfittingRisk = 'MODERATE';
-  } else if (full.totalTrades < 25) {
-    overfittingPenalty += Math.max(0, (25 - full.totalTrades) * 0.8);
-  }
-
-  // Monte Carlo stress test penalty
-  if (mcStress && mcStress.maxDrawdown95Pct > 42) {
-    overfittingPenalty += 25;
-    overfittingRisk = 'HIGH';
-    if (mcStress.maxDrawdown95Pct > 48 || mcStress.ruinProbabilityPct > 20) {
-      isRejectedOverfitted = true;
-      rejectionReason = `Stress Test Monte Carlo fallito: Max Drawdown 95° al ${mcStress.maxDrawdown95Pct}% (rischio rovina ${mcStress.ruinProbabilityPct}%).`;
-    }
-  }
-
-  // Slippage sensitivity penalty
-  if (slippageSensitivity !== undefined && slippageSensitivity < 30 && full.totalReturnPct > 0) {
-    overfittingPenalty += 15;
-    if (slippageSensitivity < 20) {
-      isRejectedOverfitted = true;
-      rejectionReason = `Eccessiva sensibilità ai costi: il profitto svanisce aumentando realisticamente lo slippage.`;
-    }
-  }
-
-  const rawScore = oosComponent + profitFactorComponent + drawdownComponent + winRateComponent + sharpeComponent - overfittingPenalty;
-  const totalScore = Math.max(1, Math.min(99, Math.round(rawScore)));
-
-  // Confidence Score (based on trade count, data quality, and OOS stability)
-  const tradePower = Math.min(40, (full.totalTrades / 50) * 40);
-  const oosPower = oosRet > 0 ? 30 : 5;
-  const ddPower = full.maxDrawdownPct < 15 ? 30 : full.maxDrawdownPct < 25 ? 15 : 5;
-  const confidenceScore = Math.min(100, Math.round(tradePower + oosPower + ddPower));
-
-  let confidenceLevel: 'ALTA' | 'MEDIA' | 'BASSA' = 'MEDIA';
-  if (confidenceScore >= 80 && overfittingRisk === 'LOW' && !isRejectedOverfitted) {
-    confidenceLevel = 'ALTA';
-  } else if (confidenceScore <= 50 || overfittingRisk === 'HIGH' || isRejectedOverfitted) {
-    confidenceLevel = 'BASSA';
-  }
-
-  return {
-    score: totalScore,
     scoreBreakdown: {
-      oosComponent: parseFloat(oosComponent.toFixed(1)),
-      profitFactorComponent: parseFloat(profitFactorComponent.toFixed(1)),
-      drawdownComponent: parseFloat(drawdownComponent.toFixed(1)),
-      winRateComponent: parseFloat(winRateComponent.toFixed(1)),
-      sharpeComponent: parseFloat(sharpeComponent.toFixed(1)),
-      overfittingPenalty: parseFloat(overfittingPenalty.toFixed(1)),
+      oosComponent: parseFloat(oosComp.toFixed(1)),
+      profitFactorComponent: parseFloat(pfComp.toFixed(1)),
+      drawdownComponent: parseFloat(ddComp.toFixed(1)),
+      winRateComponent: parseFloat(wrComp.toFixed(1)),
+      sharpeComponent: parseFloat(sharpeComp.toFixed(1)),
+      overfittingPenalty: parseFloat(oosDegradationPenalty.toFixed(1)),
       total: totalScore,
     },
-    confidenceScore,
-    confidenceLevel,
-    overfittingRisk,
-    isRejectedOverfitted,
-    rejectionReason: rejectionReason || undefined,
+    titanEct,
+    entryDistribution,
+    dataProvenance: {
+      source: options.dataProvenance?.source || 'Yahoo Finance Real OHLCV',
+      timeframe,
+      dataStatus: options.dataProvenance?.dataStatus || 'HISTORICAL_REAL',
+      isRealData: options.dataProvenance?.isRealData ?? true,
+      fetchedAt: options.dataProvenance?.fetchedAt || new Date().toISOString(),
+      warnings: provenanceWarnings,
+    },
+    costsConfig: {
+      commissionPct,
+      slippagePct,
+      spreadPct,
+    },
+    splitRatios,
+    walkForward: walkForward
+      ? {
+          available: walkForward.available,
+          windowsCount: walkForward.windowsCount,
+          positiveOosWindows: walkForward.positiveOosWindows,
+          efficiencyPct: walkForward.efficiencyPct,
+          avgOosReturnPct: walkForward.avgOosReturnPct,
+        }
+      : undefined,
   };
+}
+
+/**
+ * Titan Equity Curve Trading (ECT) Filter — uses real periodic Sharpe from equity curve (no approximations).
+ */
+export function computeTitanEctFilter(
+  equityCurve: EquityPoint[],
+  trades: Trade[],
+  initialCapital: number,
+  timeframe: Timeframe = '1D',
+  ectWindow = 10
+): TitanEctSummary {
+  const windowSize = Math.max(3, ectWindow);
+  const tradeExitMap = new Map<number, Trade[]>();
+  for (const t of trades) {
+    const list = tradeExitMap.get(t.exitTimestamp);
+    if (list) list.push(t);
+    else tradeExitMap.set(t.exitTimestamp, [t]);
+  }
+
+  let rawTradeEq = initialCapital;
+  const rawTradeHistory: number[] = [initialCapital];
+  let ectEquity = initialCapital;
+  let tradesAvoided = 0;
+  let activeTrades = 0;
+  let ectGrossProfit = 0;
+  let ectGrossLoss = 0;
+
+  const ectSeries: Array<{ timestamp: number; equity: number }> = [];
+
+  for (const pt of equityCurve) {
+    const closingTrades = tradeExitMap.get(pt.timestamp) || [];
+    for (const t of closingTrades) {
+      const smaSlice = rawTradeHistory.slice(-windowSize);
+      const sma = smaSlice.reduce((a, b) => a + b, 0) / smaSlice.length;
+      // Strict causality: evaluate whether raw equity BEFORE this trade is >= SMA
+      const isSystemActive = rawTradeHistory.length < windowSize || rawTradeEq >= sma;
+
+      if (isSystemActive) {
+        ectEquity = Math.max(0.01, ectEquity + t.pnlAmount);
+        activeTrades++;
+        if (t.pnlAmount > 0) ectGrossProfit += t.pnlAmount;
+        else ectGrossLoss += Math.abs(t.pnlAmount);
+      } else {
+        tradesAvoided++;
+      }
+
+      rawTradeEq += t.pnlAmount;
+      rawTradeHistory.push(rawTradeEq);
+    }
+
+    const smaNowSlice = rawTradeHistory.slice(-windowSize);
+    const smaNow = smaNowSlice.reduce((a, b) => a + b, 0) / smaNowSlice.length;
+    pt.titanEctEquity = parseFloat(ectEquity.toFixed(2));
+    pt.titanEctEquityPct = parseFloat((((ectEquity - initialCapital) / initialCapital) * 100).toFixed(2));
+    pt.titanEctSma = parseFloat(smaNow.toFixed(2));
+    pt.titanEctActive = rawTradeHistory.length < windowSize || rawTradeEq >= smaNow;
+
+    ectSeries.push({ timestamp: pt.timestamp, equity: ectEquity });
+  }
+
+  const rawPeriodic = computePeriodicReturnMetrics(equityCurve, timeframe);
+  const rawDd = computeDrawdownStats(equityCurve);
+  const rawTradeStats = computeTradeStats(trades, equityCurve.length, 0);
+
+  const ectPeriodic = computePeriodicReturnMetrics(ectSeries, timeframe);
+  const ectDd = computeDrawdownStats(ectSeries);
+  const titanProfitFactor =
+    ectGrossLoss > 0 ? parseFloat((ectGrossProfit / ectGrossLoss).toFixed(2)) : ectGrossProfit > 0 ? 99.99 : 0;
+
+  return {
+    enabled: true,
+    rawReturnPct: rawPeriodic.totalReturnPct,
+    titanReturnPct: ectPeriodic.totalReturnPct,
+    rawMaxDrawdownPct: rawDd.maxDrawdownPct,
+    titanMaxDrawdownPct: ectDd.maxDrawdownPct,
+    drawdownReductionPct: parseFloat(Math.max(0, rawDd.maxDrawdownPct - ectDd.maxDrawdownPct).toFixed(2)),
+    rawProfitFactor: rawTradeStats.profitFactor,
+    titanProfitFactor,
+    rawSharpeRatio: rawPeriodic.sharpeRatio,
+    titanSharpeRatio: ectPeriodic.sharpeRatio,
+    tradesAvoidedCount: tradesAvoided,
+    activeTradeRatioPct:
+      trades.length > 0 ? parseFloat(((activeTrades / trades.length) * 100).toFixed(1)) : 100,
+    ectWindowTrades: windowSize,
+  };
+}
+
+/**
+ * Backward-compatible wrapper over the deterministic seeded Monte Carlo engine.
+ */
+export function computeMonteCarloStress(
+  trades: Trade[],
+  initialCapital: number,
+  iterations = 500,
+  seed = 20260401
+): {
+  available: boolean;
+  reason?: string;
+  maxDrawdown95Pct: number | null;
+  worstCaseReturn5Pct: number | null;
+  ruinProbabilityPct: number | null;
+  lossProbabilityPct: number | null;
+  cagrP05Pct: number | null;
+  cagrP50Pct: number | null;
+  cagrP95Pct: number | null;
+} {
+  const report = runMonteCarloSimulation(trades, initialCapital, { iterations, seed });
+  return {
+    available: report.available,
+    reason: report.reason,
+    maxDrawdown95Pct: report.maxDrawdownP95Pct,
+    worstCaseReturn5Pct: report.terminalReturnP05Pct,
+    ruinProbabilityPct: report.ruinProbabilityPct,
+    lossProbabilityPct: report.lossProbabilityPct,
+    cagrP05Pct: report.cagrP05Pct,
+    cagrP50Pct: report.cagrP50Pct,
+    cagrP95Pct: report.cagrP95Pct,
+  };
+}
+
+export function computeParameterStabilityPlateau(
+  strategy: BaseStrategy,
+  instrument: Instrument,
+  timeframe: Timeframe,
+  bars: Bar[],
+  baseParams: Record<string, number | boolean | string>,
+  baseOptions: BacktestOptions,
+  baseReturnPct: number
+): number {
+  const numericDefs = strategy.definition.paramDefinitions.filter((d) => d.type === 'number').slice(0, 2);
+  if (numericDefs.length === 0) return 50;
+
+  let tested = 0;
+  let profitable = 0;
+  let closeToBase = 0;
+
+  for (const def of numericDefs) {
+    const val = Number(baseParams[def.id]);
+    if (!Number.isFinite(val)) continue;
+    const step = def.step || Math.max(0.1, Math.abs(val) * 0.15);
+    const deltas = [-step, step];
+
+    for (const d of deltas) {
+      let nextVal = val + d;
+      if (def.min !== undefined) nextVal = Math.max(def.min, nextVal);
+      if (def.max !== undefined) nextVal = Math.min(def.max, nextVal);
+      if (Math.abs(nextVal - val) < 1e-9) continue;
+
+      const sub = runBacktest(
+        strategy,
+        instrument,
+        timeframe,
+        bars,
+        { ...baseParams, [def.id]: nextVal },
+        { ...baseOptions, skipRobustnessTests: true, enableWalkForward: false, enableTitanEct: false }
+      );
+      tested++;
+      if (sub.metrics.totalReturnPct > 0) profitable++;
+      if (baseReturnPct > 0 && sub.metrics.totalReturnPct >= baseReturnPct * 0.5) closeToBase++;
+    }
+  }
+
+  if (tested === 0) return 50;
+  const profRatio = profitable / tested;
+  const proxRatio = closeToBase / tested;
+  return Math.max(5, Math.min(100, Math.round(profRatio * 60 + proxRatio * 40)));
+}
+
+export function computeSlippageSensitivity(
+  strategy: BaseStrategy,
+  instrument: Instrument,
+  timeframe: Timeframe,
+  bars: Bar[],
+  baseParams: Record<string, number | boolean | string>,
+  baseOptions: BacktestOptions,
+  baseReturnPct: number
+): number {
+  const stressed = runBacktest(strategy, instrument, timeframe, bars, baseParams, {
+    ...baseOptions,
+    slippagePct: (baseOptions.slippagePct ?? 0.03) * 2,
+    commissionPct: (baseOptions.commissionPct ?? 0.05) * 1.5,
+    skipRobustnessTests: true,
+    enableWalkForward: false,
+    enableTitanEct: false,
+  });
+
+  if (baseReturnPct <= 0) {
+    return stressed.metrics.totalReturnPct > baseReturnPct - 3 ? 40 : 15;
+  }
+  const retention = stressed.metrics.totalReturnPct / baseReturnPct;
+  return Math.max(0, Math.min(100, Math.round(retention * 100)));
+}
+
+function computeRegimeConsistency(equityCurve: EquityPoint[]): number {
+  if (equityCurve.length < 20) return 50;
+  const chunkCount = 4;
+  const chunkSize = Math.floor(equityCurve.length / chunkCount);
+  if (chunkSize < 5) return 50;
+
+  let positiveChunks = 0;
+  for (let c = 0; c < chunkCount; c++) {
+    const start = equityCurve[c * chunkSize].equity;
+    const end = equityCurve[Math.min(equityCurve.length - 1, (c + 1) * chunkSize - 1)].equity;
+    if (end >= start) positiveChunks++;
+  }
+  return Math.round((positiveChunks / chunkCount) * 100);
 }

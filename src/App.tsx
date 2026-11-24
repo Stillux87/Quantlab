@@ -1,7 +1,7 @@
 /**
  * QuantLab - Light Theme Autonomous AI Trading & Real Market Platform
  * 5 intuitive views: Panoramica, Portafoglio AI, Mercati e Grafici, Aggiornamenti AI, Backtest.
- * Strictly grounded on verified Yahoo Finance live quotes & real OHLCV history.
+ * Strictly grounded on verified Yahoo Finance live quotes, real OHLCV history, and Firebase Auth.
  */
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Header, ActiveTab } from './components/Header';
@@ -14,6 +14,13 @@ import { LightBacktestView } from './components/LightBacktestView';
 import { PaperTradingSession, Timeframe } from './types';
 import { AiAutopilotConfig, AiAutopilotState } from './types/aiAutopilot';
 import { globalPaperTradingEngine } from './services/paperTradingEngine';
+import { testFirestoreConnection } from './services/firebase';
+import {
+  AuthUserProfile,
+  signInWithGoogle,
+  signOutQuantLab,
+  subscribeAuthState,
+} from './services/authClient';
 import {
   fetchAiAutopilotState,
   runAiAutopilotCycle,
@@ -26,6 +33,7 @@ export function App() {
   const [selectedTicker, setSelectedTicker] = useState<string>('NVDA');
   const [selectedTimeframe, setSelectedTimeframe] = useState<Timeframe>('1h');
 
+  const [authUser, setAuthUser] = useState<AuthUserProfile | null>(null);
   const [aiState, setAiState] = useState<AiAutopilotState | null>(null);
   const [paperSessions, setPaperSessions] = useState<PaperTradingSession[]>([]);
 
@@ -33,6 +41,35 @@ export function App() {
   const [isRefreshingBriefing, setIsRefreshingBriefing] = useState<boolean>(false);
   const [isResetting, setIsResetting] = useState<boolean>(false);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+
+  // Subscribe to Firebase Auth & verify Firestore connectivity once on boot
+  useEffect(() => {
+    testFirestoreConnection();
+    const unsub = subscribeAuthState((user) => {
+      setAuthUser(user);
+    });
+    return () => unsub();
+  }, []);
+
+  const handleSignIn = useCallback(async () => {
+    try {
+      const user = await signInWithGoogle();
+      setActionNotice(
+        `Accesso effettuato come ${user.email || user.displayName || 'utente verificato'}. Tutte le operazioni protette sono ora abilitate.`
+      );
+    } catch (e: any) {
+      setActionNotice(e?.message || 'Accesso Google annullato o non completato.');
+    }
+  }, []);
+
+  const handleSignOut = useCallback(async () => {
+    try {
+      await signOutQuantLab();
+      setActionNotice('Disconnessione effettuata. Modalità di sola lettura attiva.');
+    } catch (e: any) {
+      setActionNotice(e?.message || 'Errore durante la disconnessione.');
+    }
+  }, []);
 
   // Subscribe to real-time paper trading sessions synchronized with the server
   useEffect(() => {
@@ -60,7 +97,6 @@ export function App() {
     return () => clearInterval(timer);
   }, [loadAiState]);
 
-  // Identify primary active AI portfolio session
   const activeSession = useMemo<PaperTradingSession | null>(() => {
     if (!paperSessions.length) return null;
     const portfolios = paperSessions.filter(
@@ -94,7 +130,7 @@ export function App() {
       }
     } catch (e: any) {
       setActionNotice(
-        e?.message || 'Errore durante il ciclo decisionale AI. Riprova tra qualche secondo.'
+        e?.message || 'Errore durante il ciclo decisionale AI. Accedi con Google per autorizzare le operazioni.'
       );
     } finally {
       setIsRunningAiCycle(false);
@@ -122,8 +158,8 @@ export function App() {
     try {
       const updatedConfig = await updateAiAutopilotConfig(partial);
       setAiState((prev) => (prev ? { ...prev, config: updatedConfig } : prev));
-    } catch (e) {
-      console.warn('Errore aggiornamento configurazione AI:', e);
+    } catch (e: any) {
+      setActionNotice(e?.message || 'Accesso richiesto per modificare la configurazione AI.');
     }
   }, []);
 
@@ -150,7 +186,7 @@ export function App() {
         'Portafoglio paper azzerato a €10.000 puliti. Pronto per un nuovo test con prezzi reali verificati.'
       );
     } catch (e: any) {
-      setActionNotice(e?.message || 'Errore durante il reset del portafoglio.');
+      setActionNotice(e?.message || 'Accesso richiesto per eseguire il reset del portafoglio.');
     } finally {
       setIsResetting(false);
     }
@@ -253,9 +289,24 @@ export function App() {
         }}
         isRunningAiCycle={isRunningAiCycle}
         onRunAiCycle={handleRunAiCycle}
+        authUser={authUser}
+        onSignIn={handleSignIn}
+        onSignOut={handleSignOut}
       />
 
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 pb-24 md:pb-12">
+        {actionNotice && activeTab !== 'home' && (
+          <div className="mb-5 px-4 py-3 rounded-lg bg-blue-50 border border-blue-200 text-sm text-blue-950 flex items-center justify-between gap-3">
+            <span>{actionNotice}</span>
+            <button
+              type="button"
+              onClick={() => setActionNotice(null)}
+              className="text-xs font-semibold text-blue-700 hover:text-blue-900 cursor-pointer shrink-0"
+            >
+              Chiudi
+            </button>
+          </div>
+        )}
         {renderView()}
       </main>
 
@@ -266,7 +317,7 @@ export function App() {
           </span>
           <span className="tabular-nums font-mono text-sky-300">
             Cambio EUR/USD live:{' '}
-            {aiState?.eurUsdRate ? aiState.eurUsdRate.toFixed(4) : '—'}
+            {aiState?.eurUsdRate ? aiState.eurUsdRate.toFixed(4) : 'N/D'}
           </span>
         </div>
       </footer>

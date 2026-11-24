@@ -1,14 +1,254 @@
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
+
+    // =========================================================================
+    // PILLAR 1: Global Default-Deny Catch-All
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Hardened Global Primitives (Order: Auth -> Static Validation -> Relational)
+    // =========================================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'stallaandrea@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isOwner(ownerUid) {
+      return isVerifiedUser() && ownerUid is string && request.auth.uid == ownerUid;
+    }
+
+    // =========================================================================
+    // Entity Validators (Strict Schema, Bounded Sizes, Type Enforcement)
+    // =========================================================================
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && data.uid.size() <= 128
+        && data.email is string && data.email.size() <= 254
+        && data.displayName is string && data.displayName.size() <= 120
+        && data.role is string && data.role in ['viewer', 'trader', 'admin']
+        && data.createdAt is int
+        && data.updatedAt is int;
+    }
+
+    function isValidPaperSession(data, sessionId) {
+      return data.keys().hasAll([
+          'id', 'ownerUid', 'strategyId', 'strategyName', 'timeframe',
+          'initialCapital', 'currentCapital', 'isActive', 'isPaused', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerUid', 'strategyId', 'strategyName', 'strategyCategory',
+          'instrument', 'timeframe', 'params', 'createdAt', 'startedAt', 'updatedAt',
+          'isActive', 'isPaused', 'initialCapital', 'currentCapital',
+          'riskPerTradePct', 'commissionPct', 'slippagePct',
+          'openPositions', 'closedTrades', 'logs', 'alerts', 'equityHistory',
+          'lastBarProcessed', 'lastEvaluatedBarTimestamp', 'marketStatusNotice',
+          'backtestId', 'backtestReference', 'entryDistribution',
+          'isPortfolio', 'portfolioName', 'portfolioAllocation', 'constituents',
+          'isConsolidated', 'consolidatedIntoSessionId', 'regimeFilter'
+        ])
+        && data.id is string && data.id == sessionId && isValidId(data.id)
+        && data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128
+        && data.strategyId is string && data.strategyId.size() >= 1 && data.strategyId.size() <= 100
+        && data.strategyName is string && data.strategyName.size() >= 1 && data.strategyName.size() <= 200
+        && data.timeframe is string && data.timeframe in ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '1D']
+        && data.initialCapital is number && data.initialCapital > 0 && data.initialCapital <= 100000000
+        && data.currentCapital is number && data.currentCapital >= 0 && data.currentCapital <= 1000000000
+        && data.isActive is bool
+        && data.isPaused is bool
+        && data.createdAt is int
+        && (!('openPositions' in data) || (data.openPositions is list && data.openPositions.size() <= 100))
+        && (!('closedTrades' in data) || (data.closedTrades is list && data.closedTrades.size() <= 5000))
+        && (!('logs' in data) || (data.logs is list && data.logs.size() <= 500))
+        && (!('alerts' in data) || (data.alerts is list && data.alerts.size() <= 100));
+    }
+
+    function isValidSavedStrategy(data, strategyId) {
+      return data.keys().hasAll([
+          'id', 'ownerUid', 'name', 'strategyId', 'strategyName', 'timeframe', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerUid', 'name', 'description', 'strategyId', 'strategyName',
+          'instrument', 'timeframe', 'dateRange', 'params', 'originalMetrics',
+          'createdAt', 'updatedAt', 'tags', 'isPortfolio', 'portfolioAllocation', 'portfolioConstituents'
+        ])
+        && data.id is string && data.id == strategyId && isValidId(data.id)
+        && data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 160
+        && (!('description' in data) || (data.description is string && data.description.size() <= 1000))
+        && data.strategyId is string && data.strategyId.size() >= 1 && data.strategyId.size() <= 100
+        && data.strategyName is string && data.strategyName.size() >= 1 && data.strategyName.size() <= 200
+        && data.timeframe is string && data.timeframe in ['1m', '5m', '15m', '30m', '1h', '2h', '4h', '1D']
+        && data.createdAt is string && data.createdAt.size() <= 64
+        && (!('tags' in data) || (data.tags is list && data.tags.size() <= 20));
+    }
+
+    function isValidServerState(data) {
+      return data.keys().hasAll(['lastHeartbeat', 'activeSessionsCount', 'serverStatus', 'tickCount'])
+        && data.keys().hasOnly(['lastHeartbeat', 'activeSessionsCount', 'serverStatus', 'tickCount', 'updatedAt', 'workerInstanceId'])
+        && data.lastHeartbeat is int
+        && data.activeSessionsCount is int && data.activeSessionsCount >= 0 && data.activeSessionsCount <= 10000
+        && data.serverStatus is string && data.serverStatus.size() <= 80
+        && data.tickCount is int && data.tickCount >= 0;
+    }
+
+    function isValidAiAutopilotState(data) {
+      return data.keys().hasAll(['config', 'updatedAt'])
+        && data.keys().hasOnly(['config', 'lastRunAt', 'lastBriefingAt', 'eurUsdRate', 'briefings', 'decisions', 'updatedAt'])
+        && data.config is map
+        && data.updatedAt is int
+        && (!('briefings' in data) || (data.briefings is list && data.briefings.size() <= 50))
+        && (!('decisions' in data) || (data.decisions is list && data.decisions.size() <= 200));
+    }
+
+    // =========================================================================
+    // Collection: /admins/{adminUid} — Strict Admin Registry
+    // =========================================================================
+    match /admins/{adminUid} {
+      allow get: if isAdmin() || (isVerifiedUser() && request.auth.uid == adminUid);
+      allow list: if isAdmin();
+      allow create, update, delete: if isAdmin() && isValidId(adminUid);
+    }
+
+    // =========================================================================
+    // Collection: /users/{userId} — Owner/Admin PII Isolation, No Role Escalation
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && request.auth.uid == userId
+        && incoming().role == 'trader';
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin() ||
+          (
+            isOwner(userId)
+            && incoming().role == existing().role
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])
+          )
+        );
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // Collection: /paper_sessions/{sessionId} — Owner/Admin Scoped Trading Sessions
+    // =========================================================================
     match /paper_sessions/{sessionId} {
-      allow read, write: if true;
+      allow get: if isVerifiedUser() && isValidId(sessionId) && (
+        existing().ownerUid == request.auth.uid || isAdmin()
+      );
+      allow list: if isVerifiedUser() && (
+        resource.data.ownerUid == request.auth.uid || isAdmin()
+      );
+      allow create: if isVerifiedUser()
+        && isValidId(sessionId)
+        && isValidPaperSession(incoming(), sessionId)
+        && (incoming().ownerUid == request.auth.uid || isAdmin());
+      allow update: if isVerifiedUser()
+        && isValidId(sessionId)
+        && isValidPaperSession(incoming(), sessionId)
+        && incoming().id == existing().id
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin() ||
+          (
+            existing().ownerUid == request.auth.uid
+            && existing().isActive == true
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'isPaused', 'isActive', 'alerts', 'updatedAt', 'marketStatusNotice'
+            ])
+          )
+        );
+      allow delete: if isVerifiedUser() && isValidId(sessionId) && (
+        existing().ownerUid == request.auth.uid || isAdmin()
+      );
     }
-    match /server_state/{stateId} {
-      allow read, write: if true;
-    }
+
+    // =========================================================================
+    // Collection: /saved_strategies/{strategyId} — Owner/Admin Saved Presets
+    // =========================================================================
     match /saved_strategies/{strategyId} {
-      allow read, write: if true;
+      allow get: if isVerifiedUser() && isValidId(strategyId) && (
+        existing().ownerUid == request.auth.uid || isAdmin()
+      );
+      allow list: if isVerifiedUser() && (
+        resource.data.ownerUid == request.auth.uid || isAdmin()
+      );
+      allow create: if isVerifiedUser()
+        && isValidId(strategyId)
+        && isValidSavedStrategy(incoming(), strategyId)
+        && (incoming().ownerUid == request.auth.uid || isAdmin());
+      allow update: if isVerifiedUser()
+        && isValidId(strategyId)
+        && isValidSavedStrategy(incoming(), strategyId)
+        && incoming().id == existing().id
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin() ||
+          (
+            existing().ownerUid == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'tags', 'updatedAt'])
+          )
+        );
+      allow delete: if isVerifiedUser() && isValidId(strategyId) && (
+        existing().ownerUid == request.auth.uid || isAdmin()
+      );
+    }
+
+    // =========================================================================
+    // Collection: /server_state/{stateId} — Admin-Write System Telemetry
+    // =========================================================================
+    match /server_state/{stateId} {
+      allow get: if isVerifiedUser() && isValidId(stateId);
+      allow list: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(stateId) && isValidServerState(incoming());
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // Collection: /ai_autopilot/{docId} — Admin-Write AI Autopilot State
+    // =========================================================================
+    match /ai_autopilot/{docId} {
+      allow get: if isVerifiedUser() && isValidId(docId);
+      allow list: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(docId) && isValidAiAutopilotState(incoming());
+      allow delete: if isAdmin();
     }
   }
 }
